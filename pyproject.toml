@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arcaea-spliter"
+version = "0.1.0"
+description = "Arcaea 拆谱程序：给 .aff 的每个判定物件分配 L/R 手标记（纯 Python，只用标准库）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+spliter = "spliter.aff_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "py"}
+packages = ["spliter"]

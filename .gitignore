@@ -1,0 +1,13 @@
+# 拆谱产物（随时可以重新生成）
+*.splited
+*.splited.txt
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# 本地临时/实验目录
+.scratch/
