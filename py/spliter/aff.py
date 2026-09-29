@@ -148,6 +148,7 @@ class AffArc:
     arctaps: list[int] = field(default_factory=list)
     line_no: int = 0
     raw: str = ""
+    noinput: int = 0                # 所在 ``timinggroup(noinput)`` 的组号（0 = 普通）
 
     @property
     def is_trace(self) -> bool:
@@ -477,6 +478,9 @@ def parse_aff(text: str) -> AffChart:
     audio_offset = 0
     density = 1.0
     in_body = False
+    noinput_group = 0             # 当前所在的 noinput 组号（0 = 不在组里）
+    noinput_seq = 0               # 已见过的 noinput 组数（发组号用）
+    noinput_depth = 0             # 当前 noinput 组的花括号深度
 
     for index, raw in enumerate(lines):
         line_no = index + 1
@@ -521,6 +525,7 @@ def parse_aff(text: str) -> AffChart:
                     hitsound=args[8], arctype=args[9],
                     smoothness=float(args[10]) if len(args) > 10 and args[10] else None,
                     line_no=line_no, raw=raw.rstrip("\r\n"),
+                    noinput=noinput_group,
                 )
             except ValueError:
                 warnings.append(f"第 {line_no} 行：arc 参数格式错误（已忽略）")
@@ -559,6 +564,7 @@ def parse_aff(text: str) -> AffChart:
                         "lane": lane, "end": int(hold_match.group("t2"))},
                 line=line_no,
                 raw_line=raw.rstrip("\r\n"),
+                noinput=noinput_group,
             ))
             continue
 
@@ -573,6 +579,7 @@ def parse_aff(text: str) -> AffChart:
                 params={"lane": lane},
                 line=line_no,
                 raw_line=raw.rstrip("\r\n"),
+                noinput=noinput_group,
             ))
             continue
 
@@ -600,10 +607,24 @@ def parse_aff(text: str) -> AffChart:
             continue
 
         # ---- 其它（camera / timinggroup / flick 等）---- #
-        # timinggroup 的结构行（`timinggroup(noinput){` 与它的右括弧 `};` / `}`）
-        # 是谱面的正常写法（Lamia 里就有很多），当前不实现分组语义、静默跳过即可，
-        # **不该报警告** —— 那只是噪声。
-        if body.startswith("timinggroup") or body in ("{", "}", "};") \
+        # timinggroup 的结构行（`timinggroup(xxx){` 与它的右括弧 `};` / `}`）
+        # 是谱面的正常写法（Lamia 里就有很多），**不该报警告** —— 那只是噪声。
+        #
+        # 这里只实现 `noinput` 的**隔离**语义（其余分组语义仍未实现）：记下组号，
+        # 拆谱时"组内物件不得影响组外"，见 :meth:`split.Scoring.isolates`。
+        if body.startswith("timinggroup"):
+            if "noinput" in body:
+                noinput_seq += 1
+                noinput_group = noinput_seq
+                noinput_depth = 1
+            continue
+        if noinput_depth and body.startswith("}"):
+            noinput_depth -= 1
+            if noinput_depth <= 0:
+                noinput_depth = 0
+                noinput_group = 0
+            continue
+        if body in ("{", "}", "};") \
                 or body.startswith("camera") or body.startswith("scenecontrol"):
             continue
         if body.startswith("flick"):
@@ -623,6 +644,7 @@ def parse_aff(text: str) -> AffChart:
                     "arc_line": arctap.arc.line_no},
             line=arctap.line_no,
             raw_line=arctap.arc.raw,
+            noinput=arctap.arc.noinput,
         ))
 
     # 地面音符行里已有的手标记（例如上次拆谱的结果）只当作"偏好"，不是硬锁定 ——

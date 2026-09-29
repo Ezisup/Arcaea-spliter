@@ -28,10 +28,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from statistics import median
 
-from .chart import Note
+from .chart import Note, isolated
 from .config import Config
-from .split import (HANDS, SplitResult, build_groups, scale_at,
-                    screen_distance, sequence_note)
+from .split import (HANDS, SAME_HAND_MARGIN_MS, SplitResult, build_groups,
+                    scale_at, screen_distance, sequence_note)
 
 #: 一个轨道的宽度（谱面坐标单位）。1 轨道 = 0.5。
 #:
@@ -82,6 +82,10 @@ class MoveRecord:
     #: 六轨段落的刻度更小，所以**必须逐次记录**，不能全局取一个常量 ——
     #: 否则 6k 段落的位移会被报成不同的轨道数。
     unit_px_x: float | None = None
+    #: 起点/终点物件的判定时刻（ms）。报告里用"时刻"而不是行号 ——
+    #: 行号只在编辑器里才有意义，玩家是按时间找位置的（与手速榜同口径）。
+    from_time: int = 0
+    to_time: int = 0
 
     def describe(self, physics=None) -> str:
         """人类可读的一行。
@@ -111,8 +115,11 @@ class MoveRecord:
             span = lanes(self.delta_x, physics, unit_px)
             speed_text = (f"{span / (self.delta_t / 1000):.2f} 轨道/秒"
                           if self.delta_t else "-")
-        return (f"第 {self.from_line}->{self.to_line} 行  {self.hand}手  "
-                f"{self.delta_t}ms 内 {motion}  ({speed_text})  "
+        # 用"时刻"表示位置（与手速榜一致）：行号只在编辑器里有意义。
+        where = (f"{self.from_time}-{self.to_time}" if self.to_time
+                 else f"第 {self.from_line}->{self.to_line} 行")
+        return (f"{self.hand}手  {self.delta_t}ms 内 {motion}  ({speed_text})  "
+                f"{where}  "
                 f"({self.from_x:+.2f},{self.from_y:.2f}) -> ({self.to_x:+.2f},{self.to_y:.2f})")
 
 
@@ -181,6 +188,45 @@ def rhythm_label(gap_ms: int) -> str:
 
 
 @dataclass
+class Spot:
+    """报告里"可定位的一处"。
+
+    `--stats` 的注意点凡是能明确列出位置的，都把位置一起给出来 ——
+    只报一个计数（"有 2 处"）读者无法回到谱面里找。
+    时刻用 ms（与位移榜/手速榜同口径），行号只在编辑器里有意义。
+    """
+
+    time: int
+    #: 结束时刻（区间类问题用，例如"长条占手"的"下一个键在何时"）。
+    end_time: int | None = None
+    hand: str = ""
+    text: str = ""
+
+    def describe(self) -> str:
+        return self.text
+
+
+@dataclass
+class Warning:
+    """一条注意点：一句话 + 可定位的具体位置（可能为空）。"""
+
+    text: str
+    spots: list[Spot] = field(default_factory=list)
+    #: 最多列几处（``None`` = 全部）。超出部分在渲染时折成"等 N 处"。
+    limit: int | None = None
+
+    def lines(self, indent: str = "  ") -> list[str]:
+        """渲染成若干行：第一行是结论，后面缩进列出位置。"""
+        rows = [self.text]
+        spots = self.spots if self.limit is None else self.spots[:self.limit]
+        rows.extend(f"{indent}- {spot.describe()}" for spot in spots)
+        hidden = len(self.spots) - len(spots)
+        if hidden > 0:
+            rows.append(f"{indent}- （还有 {hidden} 处未列出）")
+        return rows
+
+
+@dataclass
 class Stats:
     """一份谱面的拆谱指标。"""
 
@@ -224,7 +270,7 @@ class Stats:
     balance: float = 0
     hard_moves: list[MoveRecord] = field(default_factory=list)
     per_second: list[tuple[int, int]] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[Warning] = field(default_factory=list)
 
     @property
     def alternation_ratio(self) -> float | None:
@@ -304,6 +350,8 @@ def analyze(notes: list[Note], config: Config) -> Stats:
 
     # ---- 逐键：移动 / 抗 / 占手 ---- #
     moves: list[MoveRecord] = []
+    hold_spots: list[Spot] = []      # "长条占手冲突"的具体位置
+    chord_spots: list[Spot] = []     # "同手覆盖和弦"的具体位置
     for group in groups:
         if len(group) > 1:
             stats.chords += 1
@@ -311,6 +359,13 @@ def analyze(notes: list[Note], config: Config) -> Stats:
             used = {hands[index] for index in group if hands[index]}
             if len(used) < len(group):
                 stats.same_hand_chord += 1
+                group_time = notes[group[0]].time
+                chord_spots.append(Spot(
+                    time=group_time,
+                    hand=sorted(h for h in used if h)[0] if used else "",
+                    text=f"时刻 {group_time}（{len(group)} 个键，"
+                         f"{len(used)} 只手承担）",
+                ))
         for index in group:
             hand = hands[index]
             if hand is None or hand == "M":
@@ -319,8 +374,11 @@ def analyze(notes: list[Note], config: Config) -> Stats:
             if previous < 0:
                 continue
             delta_t = notes[index].time - notes[previous].time
-            if delta_t <= 0:
-                continue  # 同一时刻的另一个键：没有"移动"这回事
+            if delta_t <= SAME_HAND_MARGIN_MS:
+                # 同一个和弦内的另一个键：没有"移动"这回事。
+                # 口径与求解器一致（SAME_HAND_MARGIN_MS 内的键并成同一时刻），
+                # 否则 1ms 错位和弦会报出 1216 轨道/秒 这种假读数。
+                continue
             # 屏幕像素距离：两个轴刻度不同，必须分轴换算后勾股合成
             delta_x = screen_distance(notes[previous], notes[index], config.physics)
             speed = delta_x / (delta_t / 1000)
@@ -336,6 +394,8 @@ def analyze(notes: list[Note], config: Config) -> Stats:
                 to_line=notes[index].line,
                 hand=hand,
                 delta_t=delta_t,
+                from_time=notes[previous].time,
+                to_time=notes[index].time,
                 delta_x=delta_x,
                 speed=speed,
                 from_x=notes[previous].x,
@@ -351,8 +411,29 @@ def analyze(notes: list[Note], config: Config) -> Stats:
                 if (notes[previous].x == notes[index].x
                         and notes[previous].y == notes[index].y):
                     stats.same_hand_same_x += 1
-            if _hold_duration(notes[previous]) > delta_t:
+            # 留 SAME_HAND_MARGIN_MS 的容差：长条尾与下一个键相差 ≤2ms 时
+            # 其实是同一个和弦时刻（谱面常写 1ms 错位），不算"还没松手就要按"。
+            #
+            # 隔离组（`timinggroup(noinput)`）的演出长条**不当占手**：求解器本来就
+            # 允许组外的键与它同手，报告再报一次就是假警报（见 chart.isolated）。
+            if _hold_duration(notes[previous]) > delta_t + SAME_HAND_MARGIN_MS \
+                    and not isolated(notes[previous].noinput, notes[index].noinput):
                 stats.hold_blocked += 1
+                # 记下位置：报告里要指得出"哪一处"，只给一个数字没法定位。
+                # 用"长条头 -> 下一个键"的两个时刻表示（与位移榜/手速榜同口径）。
+                hold_time = notes[previous].time
+                hold_tail = hold_time + int(_hold_duration(notes[previous]))
+                # 注意 delta_t 是"长条头 -> 下一个键"，不是"长条尾 -> 下一个键"。
+                # 真正有意义的是**重叠了多少**：下一个键落在按住期间内。
+                overlap = hold_tail - notes[index].time
+                hold_spots.append(Spot(
+                    time=hold_time,
+                    end_time=notes[index].time,
+                    hand=hand,
+                    text=f"{hand}手 长条 {hold_time}~{hold_tail}，"
+                         f"但 {notes[index].time} 就有下一个键"
+                         f"（提前 {overlap}ms，按住期间被要求再按）",
+                ))
 
     stats.max_speed_seen = round(stats.max_speed_seen)
     # 汇总项一律**按每次移动自己的刻度**换算：六轨段落的刻度更小，
@@ -399,18 +480,30 @@ def analyze(notes: list[Note], config: Config) -> Stats:
             stats.alternating += 1
 
     # ---- 结论性提示 ---- #
+    # 只要能明确列出位置，就把位置一起给出来（见 Spot）：只报计数读者无法回查。
     if stats.none:
-        stats.warnings.append(f"仍有 {stats.none} 个物件没有标记")
+        stats.warnings.append(Warning(f"仍有 {stats.none} 个物件没有标记"))
     if stats.same_hand_chord:
-        stats.warnings.append(f"有 {stats.same_hand_chord} 个和弦被同一只手覆盖（可能存在跨度过大或原生标记冲突）")
+        stats.warnings.append(Warning(
+            f"有 {stats.same_hand_chord} 个和弦被同一只手覆盖"
+            f"（可能存在跨度过大或原生标记冲突）",
+            chord_spots, limit=WARNING_SPOT_LIMIT))
     if stats.hold_blocked:
-        stats.warnings.append(f'有 {stats.hold_blocked} 处"长条还没松手就要按下一个键"')
+        stats.warnings.append(Warning(
+            f'有 {stats.hold_blocked} 处"长条还没松手就要按下一个键"',
+            hold_spots, limit=WARNING_SPOT_LIMIT))
     if stats.over_max_speed:
-        stats.warnings.append(
+        stats.warnings.append(Warning(
             f"有 {stats.over_max_speed} 处单手移速超过极限 "
-            f"{stats.max_lane_speed_limit} 轨道/秒（物理上很勉强）")
+            f"{stats.max_lane_speed_limit} 轨道/秒（物理上很勉强）",
+            [Spot(time=move.from_time, end_time=move.to_time,
+                  hand=move.hand, text=move.describe(config.physics))
+             for move in sorted(moves, key=lambda item: -item.speed)
+             if move.speed > max_speed],
+            limit=WARNING_SPOT_LIMIT))
     if abs(stats.balance) > 0.25:
-        stats.warnings.append(f"左右手使用量偏差 {stats.balance * 100:.0f}%（超过 25%）")
+        stats.warnings.append(Warning(
+            f"左右手使用量偏差 {stats.balance * 100:.0f}%（超过 25%）"))
     return stats
 
 
@@ -419,6 +512,9 @@ def _hold_duration(note: Note) -> float:
     duration = note.duration
     return duration if duration is not None else 0.0
 
+
+#: 注意点里最多列几处具体位置（多了会把报告淹掉）。``None`` = 全列。
+WARNING_SPOT_LIMIT = 5
 
 #: 手速榜只看这三类（"手要落下去按一下"的物件）。
 #: **不含 hold 尾**，也不含音弧 —— 它们不是"再落一次"。
@@ -448,8 +544,11 @@ def _fastest_gaps(notes: list[Note], hands: list[str | None],
                    if note.type in SPEED_NOTE_TYPES and hands[i] == hand]
         for previous, current in zip(indexes, indexes[1:]):
             gap = notes[current].time - notes[previous].time
-            if gap <= 0:
-                continue        # 同一时刻：不是"两次落下"
+            if gap <= SAME_HAND_MARGIN_MS:
+                # 同一个和弦（谱面常写 1ms 错位，如 53051 arctap + 53052 hold）：
+                # 玩家是按一个和弦打下去的，不是"这个手指再落一次"。
+                # 放进榜里会报出 BPM 15000 这种没有意义的读数。
+                continue
             records.append(GapRecord(
                 gap_ms=gap,
                 hand=hand,

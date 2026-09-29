@@ -40,14 +40,19 @@ WATCH_WINDOW_MS = 10_000
 
 
 def reference_hands(path: str) -> dict:
-    """参考里每个判定物件的手（没标的就是 ``None``，比对时跳过）。"""
+    """参考里每个判定物件的手（没标的就是 ``None``，比对时跳过）。
+
+    键必须含 **y**：同刻、同 x、不同 y 的两个 arctap（cc3 里成对出现）否则会撞成
+    同一个键，参考表只剩一个值，另一个无辜的键就被判成错（曾经因此误报 16 处）。
+    """
     parsed = parse_aff(Path(path).read_text(encoding="utf-8", errors="replace"))
     table: dict = {}
     for arctap in parsed.arctaps:
-        table[(arctap.time, round(arctap.arc.x_at(arctap.time), 4), "arctap")] = HAND.get(arctap.hand)
+        table[(arctap.time, round(arctap.arc.x_at(arctap.time), 4),
+           round(arctap.arc.y_at(arctap.time), 3), "arctap")] = HAND.get(arctap.hand)
     for note in parsed.chart.notes:
         if note.type != "arctap":
-            table[(note.time, round(note.x, 4), note.type)] = HAND.get(note.params.get("_hand"))
+            table[(note.time, round(note.x, 4), round(note.y, 3), note.type)] = HAND.get(note.params.get("_hand"))
     return table
 
 
@@ -123,7 +128,7 @@ def collect(notes, result, table, in_scope):
     for index, note in enumerate(notes):
         if not in_scope(note.time):
             continue
-        want = table.get((note.time, round(note.x, 4), note.type))
+        want = table.get((note.time, round(note.x, 4), round(note.y, 3), note.type))
         if want is None:
             continue
         if result.hands[index] != want:

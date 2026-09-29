@@ -61,6 +61,8 @@ class Note:
     raw_line: str = ""              # 原始整行（不含换行符）
     index: int = 0                  # 时间升序后的序号
     raw_index: int = 0              # 文件里的原始顺序
+    noinput: int = 0                # 所在 ``timinggroup(noinput)`` 的组号
+                                    # （0 = 普通；>0 = 隔离组，见 ``split.Scoring.isolates``）
 
     # ---- 便捷取值（供代价函数用，避免到处写 params.get） ---- #
     @property
@@ -117,5 +119,18 @@ def sort_notes(notes: list[Note]) -> list[Note]:
     for index, note in enumerate(notes):
         note.index = index
     return notes
+
+
+def isolated(source_group: int, target_group: int) -> bool:
+    """``source_group`` 的约束是否**不该**作用于 ``target_group``。
+
+    ``timinggroup(noinput)`` 是演出组：里面的物件不受玩家输入，但仍要上手标记。
+    所以取折中 —— 组内物件**可以**受组外与**本组**影响，但**不能**影响组外。
+
+    放在这里是因为 ``split`` / ``constraints`` / ``report`` 三处都要用，
+    而 ``constraints`` 不能 import ``split``（循环依赖）。**三处共用这一条口径**，
+    不要各写一份，否则迟早漂移。
+    """
+    return source_group != 0 and source_group != target_group
 
 

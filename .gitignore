@@ -11,3 +11,4 @@ dist/
 
 # 本地临时/实验目录
 .scratch/
+charts/

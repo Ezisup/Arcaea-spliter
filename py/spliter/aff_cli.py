@@ -258,7 +258,15 @@ def _report_lines(args, parsed, result, out_path, elapsed_ms, before_stats, afte
         notes = [*result.warnings, *after_stats.warnings]
         if notes:
             lines.extend(["", "需要注意:"])
-            lines.extend(f"  - {note}" for note in notes)
+            for note in notes:
+                # Warning 自带可定位的位置（见 report.Spot）；
+                # 求解器给的 result.warnings 还是纯字符串。
+                if hasattr(note, "lines"):
+                    rendered = note.lines(indent="      ")
+                    lines.append(f"  - {rendered[0]}")
+                    lines.extend(rendered[1:])
+                else:
+                    lines.append(f"  - {note}")
     if args.explain is not None:
         limit = None if str(args.explain) == "0" else int(args.explain)
         # 地面 / 天空都给：arctap 的归属同样是判断依据的一部分。

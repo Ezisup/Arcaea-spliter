@@ -29,11 +29,12 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from itertools import product
 from typing import Iterable, Iterator, Mapping, Sequence
 
-from .chart import Note
+from .chart import Note, isolated
 from .config import Config, resolve_width_expr
 
 HANDS: tuple[str, str] = ("L", "R")
@@ -145,6 +146,9 @@ class Scoring:
         self.cost = config.cost
         self.space = config.space
         self.n = len(self.notes)
+        # 每个物件所属的 ``timinggroup(noinput)`` 组号（0 = 普通）。
+        # 隔离组只实现**单向**影响，见 :meth:`isolates`。
+        self.noinput: list[int] = [note.noinput for note in self.notes]
         meta = meta or {}
         meta_width = meta.get("noteWidth")
         self.default_width = float(meta_width) if isinstance(meta_width, (int, float)) and meta_width else DEFAULT_NOTE_WIDTH
@@ -182,6 +186,9 @@ class Scoring:
         self._order_of: list[int] = [0] * self.n
         for position, index in enumerate(self._order):
             self._order_of[index] = position
+        # `_order` 时刻表（升序）：`_feasible_region` 要按时间二分找"落在某条长条
+        # 占手区间内"的物件，见 _hold_extended_stop。
+        self._times: list[int] = [self.notes[index].time for index in self._order]
         # 给每个物件记下它所在的那个"同时刻组"，供可行性检查用
         self._group_of: list[list[int]] = [self.groups[0]] * self.n if self.groups else []
         for group in self.groups:
@@ -234,7 +241,7 @@ class Scoring:
                 mate = self.notes[member]
                 if abs(mate.y - note.y) > _LANE_Y_EPS:
                     continue
-                if _LANE_PAIR_MIN <= abs(mate.x - note.x) <= _LANE_PAIR_MAX:
+                if _is_lane_pair(abs(mate.x - note.x)):
                     self.lane_side[index] = "L" if note.x < mate.x else "R"
                     break
 
@@ -247,12 +254,15 @@ class Scoring:
 
         self.centers: list[float] = [0.0] * self.n
         self.bias: list[float] = [0.0] * self.n
+        # 物件下标 -> 它作为长条的占手区间末端（非长条没有条目）
+        self.hold_end: dict[int, int] = {}
         for position, index in enumerate(self._order):
             note = self.notes[index]
             if note.type != "hold":
                 continue
             end = int(note.params.get("end", note.time + (note.params.get("duration") or 0)))
             self._hold_spans.append((note.time, end, position, note.x, note.y))
+            self.hold_end[index] = end
         # 预先算好"每个物件落在哪些长条的占手窗口内"，避免每次评分都全表扫。
         # 窗口取**权重侧**的（含 hold_tail_relax 的提前松手），所以 100ms 那种
         # 短长条（本来就因 hold_min_duration 不算占手）不会进这张表。
@@ -263,6 +273,8 @@ class Scoring:
             for index, note in enumerate(self.notes):
                 if index == hold_index:
                     continue
+                if self.isolates(hold_index, index):
+                    continue              # 隔离组的长条不对组外收占手代价
                 # 与硬规则**同样的场合**：区间内（权重侧窗口，可提前 100ms 松手）
                 # 前后各放宽 SAME_HAND_MARGIN_MS，以及"结尾同刻、落在别的位置"
                 # （谱面会避免结尾同色，所以那时该换手）。
@@ -289,6 +301,9 @@ class Scoring:
         #: 多指段里**直接定死**的手标记（见 _multi_finger_hands）
         self.multi_hand: dict[int, str] = {}
         self.multi_finger_times: list[tuple[int, int]] = []
+        #: 多指时刻 -> 每只手的**弧触点数**（同一只手最多算一个；与判定物件同点的
+        #: 不重复计）。_realizations 用它做"两手触点数差 <= 1"的硬约束。
+        self.moment_arcs: dict[int, dict[str, int]] = {}
         #: 实在找不到合法手标记的物件（硬约束自相矛盾时才会出现，见 _realizations）
         self.unresolved: list[int] = []
         self._scan_multi_finger()
@@ -366,6 +381,22 @@ class Scoring:
         # （不许改动钉手）。这样"钉手与硬约束打架"时不会两头都判非法。
         return True
 
+    def isolates(self, source: int, target: int) -> bool:
+        """``source`` 的约束是否**不该**作用于 ``target``。
+
+        ``timinggroup(noinput)`` 是演出组：里面的物件不受玩家输入，但仍要**上手标记**
+        （否则一堆拆好的键里冒出两个原色会很突兀）。所以取折中——
+
+        - 组内物件**可以**受组外、以及**本组**的影响（正常参与约束）；
+        - 组内物件**不能**影响组外。
+
+        这一条正是"No input 的装饰长条把普通配置抬成多指段、于是整段无视硬约束"
+        那个 bug 的修复点：noinput 的长条/弧只在本组内生效。
+
+        没有 noinput 组时恒为 ``False``，所以普通谱面的行为**逐位不变**。
+        """
+        return isolated(self.noinput[source], self.noinput[target])
+
     def hold_tail_hand(self, index: int, hands: Sequence[str | None]) -> str | None:
         """这个键是否被"长条尾指"钉在某只手上（已经定了那只手时才返回它）。
 
@@ -385,6 +416,8 @@ class Scoring:
                 break                         # 后面的长条都还没开始（按起点有序）
             if hold_position == position:
                 continue
+            if self.isolates(self._order[hold_position], index):
+                continue                      # 隔离组的长条不钉组外的键
             if abs(time - end) <= 5 and _same_pos(x, y, tail_x, tail_y):
                 hand = hands[self._order[hold_position]]
                 if hand in HANDS:
@@ -426,6 +459,8 @@ class Scoring:
             if hold_position == position:
                 continue
             other = self._order[hold_position]
+            if self.isolates(other, index):
+                continue                      # 隔离组的长条不挡组外的键
             if hands[other] != hand:
                 continue
             if tail_hand == hand:
@@ -469,56 +504,71 @@ class Scoring:
             else:
                 at_time[time] = [index]
         # 非判定物件：长条的落点固定；实体弧要按时刻求位置（弧可能在移动）
-        holds: list[tuple[int, int, float, float]] = []
+        holds: list[tuple[int, int, float, float, int]] = []
         for start, end, position, _tail_x, _tail_y in self._hold_spans:
-            hold = self.notes[self._order[position]]
-            holds.append((start, end, hold.x, hold.y))
+            hold_index = self._order[position]
+            hold = self.notes[hold_index]
+            holds.append((start, end, hold.x, hold.y, self.noinput[hold_index]))
         arcs: list[object] = []
         arcs_by_hand = getattr(self.constraints, "arcs_by_hand", None) or {}
         for group in arcs_by_hand.values():
             arcs.extend(group)
         marked: dict[int, int] = {}
         for time, indexes in at_time.items():
-            spots = {_spot(self.notes[i].x, self.notes[i].y) for i in indexes}
-            for start, end, x, y in holds:
+            # 落点按**组**分桶（0 = 组外）。隔离组的物件只算给它自己和本组 ——
+            # 组外的普通配置不该被装饰性的长条/弧抬成多指段（那会让整段无视硬约束）。
+            spots_by_group: dict[int, set[tuple[float, float]]] = {}
+            arcs_by_group: dict[int, dict[tuple[float, float], str]] = {}
+            counted_by_group: dict[int, set[str]] = {}
+            for index in indexes:
+                spots_by_group.setdefault(self.noinput[index], set()).add(
+                    _spot(self.notes[index].x, self.notes[index].y))
+            for start, end, x, y, group in holds:
                 if start <= time <= end:
-                    spots.add(_spot(x, y))
+                    spots_by_group.setdefault(group, set()).add(_spot(x, y))
             # 实体弧在**这一刻的采样点**（长度无关）：它同样是一个触点，
             # 并且带着自己**已经定好**的颜色（手）参与同 y 的左右排序。
-            # 实体弧在**这一刻的采样点**：它既是触点（占一根手指），又带着
-            # 自己**已经定好**的颜色（手）。黑线（arctype=true）不参与：
-            # 它的 color 只是占位符、没有任何语义，而挂在它上面的天键本来
-            # 就会被正常流程算过一遍，再用黑线的颜色去"锚"一次就是重复计算。
-            arc_points: dict[tuple[float, float], str] = {}
-            arc_hand_counted: set[str] = set()
+            # 黑线（arctype=true）不参与：它的 color 只是占位符、没有任何语义，
+            # 而挂在它上面的天键本来就会被正常流程算过一遍。
             for arc in arcs:
                 lo, hi = min(arc.t1, arc.t2), max(arc.t1, arc.t2)
                 if not (lo <= time <= hi):
                     continue
+                group = getattr(arc, "noinput", 0)
                 spot = _spot(arc.x_at(time), arc.y_at(time))
                 hand = _COLOR_HAND.get(arc.color)
-                if hand and spot not in arc_points:
-                    arc_points[spot] = hand
+                points = arcs_by_group.setdefault(group, {})
+                if hand and spot not in points:
+                    points[spot] = hand
                 # **同一只手的多条弧只算一个触点**：谱面允许同一时刻出现多条
                 # 同色弧（新版本能解析），但判定上"当成一条"就够 —— 否则两条
                 # 同色弧会被数成两根手指，把普通配置误抬成多指段，而多指段会
                 # 整段无视"有弧时不得同色"这条硬约束（用户报的就是这个 bug）。
-                if hand is not None and hand in arc_hand_counted:
+                counted = counted_by_group.setdefault(group, set())
+                if hand is not None and hand in counted:
                     continue
-                spots.add(spot)
+                spots_by_group.setdefault(group, set()).add(spot)
                 if hand is not None:
-                    arc_hand_counted.add(hand)
-            if len(spots) >= minimum:
+                    counted.add(hand)
+            outer_spots = spots_by_group.get(0, set())
+            outer_points = arcs_by_group.get(0, {})
+            for group in sorted({self.noinput[i] for i in indexes}):
+                hits = [i for i in indexes if self.noinput[i] == group]
+                if not hits:
+                    continue
+                # 组内：组外落点 + **本组**落点。组外物件只看组外落点。
+                merged = outer_spots | spots_by_group.get(group, set())
+                if len(merged) < minimum:
+                    continue
                 # 组内**每个物件**都要定手（含长条）：多指配置里长条也是
                 # 一根手指，同样"只看空间"。
-                for index in indexes:
-                    self.multi_finger.add(index)
+                self.multi_finger.update(hits)
                 # 手标记**直接定死**：弧的采样点 + 各物件的落点一起参与
                 # "同 y 从左到右分左右"，不同键之间的前后关系一律不看。
-                if indexes:
-                    self.multi_hand.update(
-                        self._multi_finger_hands(indexes, arc_points))
-                marked[time] = len(spots)
+                points = outer_points if group == 0 else {
+                    **outer_points, **arcs_by_group.get(group, {})}
+                self.multi_hand.update(self._multi_finger_hands(hits, points))
+                marked[time] = max(marked.get(time, 0), len(merged))
         self.multi_finger_times = sorted(marked.items())
 
     def _multi_finger_hands(self, indexes: list[int],
@@ -596,7 +646,60 @@ class Scoring:
             if not anchored and out.get(first) == out.get(second):
                 left, right = sorted(indexes, key=lambda i: self.notes[i].x)
                 out[left], out[right] = "L", "R"
+        self._balance_multi_hands(out, indexes, arc_points)
         return out
+
+    def _balance_multi_hands(self, out: dict[int, str], indexes: list[int],
+                             arc_points: Mapping[tuple[float, float], str]) -> None:
+        """多指段里两只手的**触点数**之差不得超过 1（用户口径，就地改 ``out``）。
+
+        "一边 3 个一边 1 个"是打不出来的 —— 那要求一只手同一刻按住 3 个点。
+        这条规则的优先级**高于**"同 y 从左到右分左右"：空间排布再好看，
+        只要数量差到 2 就必须挪。
+
+        只挪**自由键**（没有原生标记的）；原生标记是谱面写死的，
+        宁可数量不齐也不动它。
+        """
+        free = [i for i in indexes if not self.sides[i]]
+        if len(free) < 2:
+            return
+        counts = self._multi_hand_counts(out, indexes, arc_points)
+        # 挪"最靠近另一只手"的那些：按到对侧手的距离升序，先挪代价最小的。
+        other = {"L": "R", "R": "L"}
+        while abs(counts["L"] - counts["R"]) > 1:
+            major = "L" if counts["L"] > counts["R"] else "R"
+            movable = [i for i in free if out.get(i) == major]
+            if not movable:
+                return
+            # 挑位置最靠对手侧的：major 为 L 时取 x 最大的（最靠右）
+            pick = max(movable, key=lambda i: self.notes[i].x) if major == "L" \
+                else min(movable, key=lambda i: self.notes[i].x)
+            out[pick] = other[major]
+            counts[major] -= 1
+            counts[other[major]] += 1
+            free.remove(pick)
+
+    def _multi_hand_counts(self, out: Mapping[int, str], indexes: list[int],
+                           arc_points: Mapping[tuple[float, float], str]
+                           ) -> dict[str, int]:
+        """这一刻两只手各要落几个触点（判定物件 + 实体弧，同点不重复计）。"""
+        counts = {"L": 0, "R": 0}
+        occupied: set[tuple[float, float]] = set()
+        for index in indexes:
+            hand = out.get(index)
+            if hand not in counts:
+                continue
+            counts[hand] += 1
+            occupied.add(_spot(self.notes[index].x, self.notes[index].y))
+        # 实体弧每个手最多算一个触点（多条同色弧在判定上是"一条"），
+        # 而且与判定物件落在一起的是同一根手指，不重复计。
+        counted: set[str] = set()
+        for spot, hand in arc_points.items():
+            if hand not in counts or hand in counted or spot in occupied:
+                continue
+            counted.add(hand)
+            counts[hand] += 1
+        return counts
 
     def cross_cost(self, previous: int, previous_hand: str | None,
                    index: int, hand: str | None) -> float:
@@ -778,16 +881,26 @@ class Scoring:
 
         # ---- 手最早能开始移动的时刻，以及那一刻手在哪个位置 ---- #
         start_x, start_y = notes[first].x, notes[first].y
-        if self.hold_duration[first] > 0:
+        # 隔离组的长条**不当占手**：它的占手效应不得外溢到组外的键（见 isolates）。
+        holds_here = self.hold_duration[first] > 0 and not self.isolates(first, second)
+        if holds_here:
             tail = notes[first].time + self.hold_duration[first]
             # 按住期间手被钉在长条上：这段时间不能算作"可以用来移动的时间"。
             # 手指在长条**结束那一刻停在尾巴位置**，所以从松手到下一个键
             # 只有 (dt - 按住时长) 的时间可用。
-            if tail > notes[second].time:
-                # 手还按在长条上（下一个键落在按住期间）：这一下等于要求它"同时在
-                # 两处"，手指被钉住、根本没在移动，所以**不做位移速度判定**
+            if tail >= notes[second].time:
+                # 手还按在长条上（下一个键落在按住期间**或正好同刻**）：
+                # 手指被钉在长条上、根本没在移动，所以**不做位移速度判定**
                 # （否则 travel_time=0 会让速度项炸成天文数字）。这笔冲突的代价
-                # 统一由 hold_conflict_cost() 按"距离"收，见那里。
+                # 统一由 hold_conflict_cost() 收，见那里。
+                #
+                # 用 >= 而不是 >：**尾指同刻**必须和"按住期间"同样处理。
+                # 尾指同刻只有两种可能，都不是"移动"：
+                #   - 落在原地（arc 尾原地 tap 那种）：手就在那儿，松手即按下，
+                #     合法且不该罚（hold_tail_hand 也正要求它同手）；
+                #   - 落在别处：手要同时在两处，本来就不合理，由 busy 收代价。
+                # 曾经写成 >，于是恰好同刻时落到下面"释放点压在键上"的分支，
+                # 白收 40.0，而且和 busy 重复收费（同手 total 64 而非 20）。
                 return 0.0
             release_time = tail
         else:
@@ -1165,6 +1278,13 @@ _STREAM_ALT_BONUS = 0.3
 #: 所以留成开关，取值以两侧参考的总体表现决定。
 HOLD_ARC_OVERLAP = True
 
+#: 多指段的手标记策略：
+#: ``True``  = 硬钉（历史口径：只看绝对空间 + 同 y 左右分半）
+#: ``False`` = 只钉**原生 side 标记**；其余自由键交给代价模型（双指类似的空间
+#:             罚分）定，并用"两手触点数差 <= 1"作为**硬约束**兜底（用户口径：
+#:             强限制数量差在 ±1 以内就不会出现"一边 3 个一边 1 个"的坏解）。
+MULTI_HAND_PIN = True
+
 #: "出张扣分"（``space.reach``）的间隔阈值（ms）：**间隔够大**才收这笔账。
 #: 用户口径就是这个 100ms：时间足够时手来得及换到正确的一侧，出张没有理由；
 #: 间隔很短时不收（快速交互里两手本来就要来回跨）。
@@ -1205,12 +1325,18 @@ _CROSS_MUTUAL_MS = 250.0
 _CROSS_MUTUAL = 1.0
 _CROSS_STILL = 1.0
 
-#: "同刻同 y、相差**正好一个轨道**"的一对键（见 ``SpaceConfig.lane_reverse``）。
-#: 用户强调：只在这个 0.5 的间距上生效 —— 差值 >= 1.0（哪怕其他条件都符合）
-#: 不能用这条规则，所以判据收得很紧（0.45~0.55）。
-_LANE_PAIR_MIN = 0.45
-_LANE_PAIR_MAX = 0.55
+#: "同刻同 y、相差**整数个轨道**"的一对键（见 ``SpaceConfig.lane_reverse``）。
+#: 用户口径：这种静态反手要狠狠罚，而且**不限于相邻的那一个轨道** ——
+#: 1、2、3 个轨道（0.5 / 1.0 / 1.5）的间距都算。差值不是整数轨道
+#: （例如弧线经过的任意位置）时不适用，所以判据仍然收得很紧。
+_LANE_PAIR_SPACINGS = (0.5, 1.0, 1.5)
+_LANE_PAIR_TOL = 0.05
 _LANE_Y_EPS = 1e-3
+
+
+def _is_lane_pair(dx: float) -> bool:
+    """``|Δx|`` 是不是"1~3 个整数轨道"（见 ``_LANE_PAIR_SPACINGS``）。"""
+    return any(abs(dx - spacing) <= _LANE_PAIR_TOL for spacing in _LANE_PAIR_SPACINGS)
 
 #: 同位置连按（死区内、非 bullet）的**时间因子加速**（平方）：间隔越短，
 #: "抬指再落"的难度是加速上升的 —— 46ms 的同键连按远比两次 93ms 交替难，
@@ -1359,10 +1485,13 @@ def delta(scoring: "Scoring", hands: list[str | None], changed: Sequence[int],
     if hi < 0:
         return current
     lo = max(0, lo)
-    # 往右扩到"两只手都各自又出现过"之后的一小段
+    # 往右扩到"两只手都各自又出现过"之后的一小段。
+    # **必须从 hi + 1 起算**：被改的那个键自己也算"这只手出现了一次"，
+    # 从 hi 起算会让"两手都又出现"提前一条满足，段尾漏掉"同一只手的下一个键"
+    # —— 而那条键的 move 正是以被改的键为 previous，实测能差出 39.9（封顶罚）。
     seen: set[str] = set()
     hi2 = hi
-    for position in range(hi, n):
+    for position in range(hi + 1, n):
         hand = dense_new[position] if dense_new[position] not in (None,) else None
         if hand and hand != "M":
             seen.add(hand)
@@ -1554,6 +1683,8 @@ def _segment_sum(scoring: "Scoring", dense: list[str | None], lo: int, hi: int,
         if g_start > 0:
             dt = scoring.notes[scoring._order[g_start]].time                 - scoring.notes[scoring._order[g_start - 1]].time
         parts.switch += scoring.group_switch_cost(previous_hand, used, dt)
+        # **同刻组内不算"交叉"**：进组前给每只手的最近键拍快照。
+        group_last = dict(last_by_hand)
         for position in range(g_start, g_end + 1):
             index = scoring._order[position]
             hand = dense[position]
@@ -1567,7 +1698,7 @@ def _segment_sum(scoring: "Scoring", dense: list[str | None], lo: int, hi: int,
                     previous_time_index, dense[scoring._order_of[previous_time_index]],
                     index, hand)
             parts.cross += scoring.hand_cross_cost(
-                index, hand, lambda h: last_by_hand.get(h))
+                index, hand, lambda h: group_last.get(h))
             previous = last_by_hand.get(hand)
             if previous is not None:
                 parts.move += scoring.move_cost(previous, index, hand)
@@ -1840,6 +1971,16 @@ def _realizations(scoring: Scoring, group: list[int],
 
     def walk(slot: int, used: frozenset[str]) -> None:
         if slot == len(group):
+            # 多指时刻：**两手触点数差不得超过 1**（用户口径的硬限制）。
+            # 计数 = 本组判定物件的手 + 该时刻每只手的弧触点数。
+            arcs_here = scoring.moment_arcs.get(scoring.notes[group[0]].time)
+            if arcs_here:
+                counts = dict(arcs_here)
+                for hand in current:
+                    if hand in counts:
+                        counts[hand] += 1
+                if abs(counts.get("L", 0) - counts.get("R", 0)) > 1:
+                    return
             results.append([hand for hand in current])  # type: ignore[misc]
             return
         index = group[slot]
@@ -1953,6 +2094,7 @@ def _expand(scoring: Scoring, state: _State, group: list[int], assignment: list[
     counts = dict(state.counts)
     cost = state.cost
 
+    group_last = dict(last)      # 同刻组内不算"交叉"（与 _segment_sum 一致）
     for slot, index in enumerate(group):
         hand = assignment[slot]
         if not ignore_hold_conflict and scoring.hold_conflict(index, hand, hands):
@@ -1985,7 +2127,7 @@ def _expand(scoring: Scoring, state: _State, group: list[int], assignment: list[
 
         cost += scoring.bias_cost(index, hand)
         cost += scoring.hold_conflict_cost(index, hand, lambda i: hands[i])
-        cost += scoring.hand_cross_cost(index, hand, lambda h: last.get(h))
+        cost += scoring.hand_cross_cost(index, hand, lambda h: group_last.get(h))
         if not scoring.is_locked(index):
             counts[hand] += 1
         last[hand] = index
@@ -2153,6 +2295,32 @@ def _feasible(scoring: Scoring, hands: list[str | None], index: int) -> bool:
     return _feasible_region(scoring, hands, group[0], group[-1] + 1)
 
 
+def _hold_extended_stop(scoring: Scoring, start: int, stop: int) -> int:
+    """把 ``[start, stop)`` 里**长条**的占手区间并进来，返回扩展后的 ``stop``。
+
+    长条换手会牵动它**整段**：区间里的键必须换手，尾指同刻的键也算。局部优化
+    只查"被翻物件自己那一刻的组"是不够的 —— 把长条翻到与区间**后面**某个键同手
+    时查不出来（实测 ``cc_test.txt`` 109833 / 113166）。所以可行性检查要按扩展后
+    的区间来做。
+
+    只有**长条**需要扩展：翻一个非长条的键不会改变任何长条的占手关系，也就
+    不会在区间外造出新违规。
+    """
+    end_slots = scoring.hold_end
+    if not end_slots:
+        return stop
+    times = scoring._times
+    order = scoring._order
+    extended = stop
+    slot = start
+    while slot < extended:                 # 扩展段里可能还有长条，边扫边扩
+        end = end_slots.get(order[slot])
+        if end is not None:
+            extended = max(extended, bisect_right(times, end + 5))
+        slot += 1
+    return min(extended, scoring.n)
+
+
 def _feasible_region(scoring: Scoring, hands: list[str | None],
                      start: int, stop: int) -> bool:
     """``[start, stop)`` 这段（以及它们各自的同刻伙伴）是否满足硬约束。
@@ -2163,6 +2331,8 @@ def _feasible_region(scoring: Scoring, hands: list[str | None],
     """
     if start < 0 or stop > scoring.n or start >= stop:
         return False
+    # 区域内有长条时，把它的占手区间一起查（否则长条换手造成的区间外违规查不出）
+    stop = _hold_extended_stop(scoring, start, stop)
     for index in range(start, stop):
         if not hands[index] or not scoring.can_hand(index, hands[index]):
             return False

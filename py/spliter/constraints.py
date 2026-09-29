@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 from .aff import (HAND_LEFT, HAND_RIGHT, PIXELS_PER_UNIT_X, PIXELS_PER_UNIT_Y,
                   AffChart, AffArc)
-from .chart import Note
+from .chart import Note, isolated
 from .split import HANDS, HOLD_ARC_OVERLAP, SAME_HAND_MARGIN_MS
 
 __all__ = ["ArcConstraints", "build_arc_constraints"]
@@ -139,8 +139,8 @@ def _is_judgeable(note: Note) -> bool:
     return note.type in JUDGEABLE_TYPES
 
 
-def _hold_windows(notes: list[Note]) -> list[tuple[int, int, str, int]]:
-    """所有 hold 的占手区间：``(起, 止, 手, 物件下标)``。
+def _hold_windows(notes: list[Note]) -> list[tuple[int, int, str, int, int]]:
+    """所有 hold 的占手区间：``(起, 止, 手, 物件下标, 隔离组号)``。
 
     hold 与音弧是同一条原则：手指按住期间不能去点别的键，
     所以区间内的其它判定物件应当换手。
@@ -152,7 +152,7 @@ def _hold_windows(notes: list[Note]) -> list[tuple[int, int, str, int]]:
         if not note.side:
             continue                      # 没有手标记就不成约束（理论上不会发生）
         end = int(note.params.get("end", note.time + (note.params.get("duration") or 0)))
-        windows.append((note.time, end, note.side, index))
+        windows.append((note.time, end, note.side, index, note.noinput))
     return windows
 
 
@@ -250,7 +250,8 @@ def build_arc_constraints(parsed: AffChart, notes: list[Note],
                 note = notes[index]
                 px_x, px_y = _scale_at(schedule, note.time, unit_px_x, unit_px_y)
                 on_head = [arc for arc in starts_here
-                           if _same_point(note, arc, px_x, px_y)]
+                           if not isolated(arc.noinput, note.noinput)
+                           and _same_point(note, arc, px_x, px_y)]
                 if not on_head:
                     continue              # 同刻但不同点：交给规则 3 判"异手"
                 hands_here = {INT_TO_HAND[arc.color] for arc in on_head}
@@ -287,14 +288,18 @@ def build_arc_constraints(parsed: AffChart, notes: list[Note],
                 lo, hi = min(arc.t1, arc.t2), max(arc.t1, arc.t2)
                 if note_end < lo - SAME_HAND_MARGIN_MS or note.time > hi + SAME_HAND_MARGIN_MS:
                     continue
+                if isolated(arc.noinput, note.noinput):
+                    continue              # 隔离组的弧不限制组外的键
                 if _is_own_arctap(own_spots, arc, note):
                     continue                  # 挂在它自己身上的 arctap：同一根手指
                 blocking.add(INT_TO_HAND[arc.color])
                 reasons.append(f"音弧 color={arc.color}")
             # hold 的占手区间：区间内（不含尾指那一刻）不能同手
-            for start, end, hand, hold_index in holds:
+            for start, end, hand, hold_index, hold_group in holds:
                 if hold_index == index:
                     continue
+                if isolated(hold_group, note.noinput):
+                    continue              # 隔离组的长条不挡组外的键
                 if start < note.time < end:
                     blocking.add(hand)
                     reasons.append(f"长条 t=[{start},{end}] 占着 {hand} 手")

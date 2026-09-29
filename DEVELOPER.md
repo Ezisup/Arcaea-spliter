@@ -21,9 +21,9 @@ arcaea_spliter/                （仓库根就是这个项目本身）
 │   ├── constraints.py      音弧颜色 -> 硬约束（ArcConstraints）
 │   ├── config.py           全部参数（dataclass）+ 校验
 │   ├── split.py            拆谱核心：代价函数 + 束搜索 + 局部优化
-│   ├── report.py           质量指标 / 拆前拆后对比 / 逐键解释
+│   ├── report.py           质量指标 / 拆前拆后对比 / 逐键解释 / 注意点定位
 │   └── aff_cli.py          唯一的命令行入口
-├── py/tests/test_aff.py    84 条自测（unittest，全部自足）
+├── py/tests/test_aff.py    112 条自测（unittest，全部自足）
 ├── tools/diff_report.py    与人工参考逐键对照，输出 Markdown 表
 ├── tools/compare.py        自动锁定观察区间后反复复查
 ```
@@ -77,6 +77,14 @@ def split(notes, config, meta=None, constraints=None):
 四项检查的顺序有意义：**`_enforce_hold_tail` 必须放在 `_refine` 之后**。
 "长条尾指同手"是语义要求，不该由代价和平局决定；它在求解过程里只是候选生成
 ／可行性检查的一个条件，被平局或局部优化绕过的可能性不值得赌，所以最后统一收口。
+
+它的**兄弟规则**"长条占手"（区间内不得同手）不需要这样一个收口 pass —— 那条
+已经由 `_feasible_region` 的区间扩展堵住了，见 §2.4。两条规则的分工是：
+
+| 规则 | 保证方式 |
+| --- | --- |
+| 尾指同手（**必须**同手） | `_enforce_hold_tail` 最后强制 |
+| 区间异手（**不得**同手） | `_feasible_region` + `_hold_extended_stop`（正本清源） |
 
 `scoring.unresolved` 非空时追加一条警告（硬约束自相矛盾，已按
 "原生标记 → 多指钉手 → 绝对左右"兜底，需人工复核）。
@@ -195,6 +203,23 @@ walk(slot, used):
 **可行性检查必须按"区域 + 整组"**：`_feasible(scoring, hands, index)` 实际委托给
 `_feasible_region(scoring, hands, group[0], group[-1]+1)`。把双押左边那个键翻到
 和右边同一只手，只检查被翻的那一个键是查不出来的。
+
+**而且区域里的长条要把自己的占手区间并进来**（`_hold_extended_stop`）。
+只查"被翻物件**自己那一刻**的组"还漏一种情况：**长条换手会牵动它整段** ——
+把长条翻到与区间**后面**某个键同手时，那个键不在区域里，于是查不出来。
+
+> 实测 bug（`cc_test.txt` 109833 / 113166）：波束搜索给的是对的
+> （`hold=R, tap=L`），被 `_refine` 翻成了 `hold=L, tap=L` —— 长条按住期间
+> 同一只手又去按了旁边一个键。两个条件缺一不可：
+> ① 上面这个区域漏洞；② 那种 167ms 的短长条（< `hold_min_duration` = 260）
+> 在**权重侧**根本不算占手，所以"翻过去"不花一分代价，局部优化就一定会去翻。
+>
+> 修完之后 `cc_test.txt` 的代价从 14.08 升到 **16.32**（那个便宜解本来就是
+> 靠违规换来的），而 `deinosphainein_2` 的代价**一位没变**（2192.2492）——
+> 只在"以前在作弊"的谱面上生效。
+>
+> 五种邻域全部经过 `_feasible` / `_feasible_region`，所以这一改之后
+> `_refine` 不可能再产出"长条占手"违规，不需要再补一个事后收口 pass。
 
 `_feasible_region` 里三种情况：
 - **多指组**：允许同手，但手标记必须与 `sides[index] or multi_hand.get(index)` 一致
@@ -440,6 +465,54 @@ y 方向：`y = 1.61` 在 4k 刻度下是 `525px`，在 6k 刻度下是 `326px` 
    只有 `tap` / `hold` 补末尾参数，`arctap` 在括号内补。
    非判定行逐字保留、行数不变。这三条都有测试守着。
 
+### 4.6 `timinggroup(noinput)` 的隔离语义（单向影响）
+
+`noinput` 是**演出组**：里面的物件不受玩家输入，但仍然要**上手标记** ——
+否则一堆拆好的键里冒出两个原色会很突兀。所以取折中，规则只有一条：
+
+> **组内物件可以受「组外」和「本组」的影响，但不能影响「组外」。**
+
+实现是「一处判据 + 四处使用」，改任何一处都要回头看其余：
+
+| 位置 | 干什么 |
+| --- | --- |
+| `aff.parse_aff` | 跟踪 `timinggroup(noinput){ … };`，把组号写进 `Note.noinput` / `AffArc.noinput`（0 = 普通） |
+| `chart.isolated(src, dst)` | **唯一的判据**：源物件在隔离组、且和目标是**不同组** → 约束不生效 |
+| `split.Scoring.isolates` | 长条侧对 `chart.isolated` 的薄封装（读 `self.noinput`） |
+| `constraints` / `report` | 硬约束侧、报告侧直接用 `chart.isolated` |
+
+判据**只放 `chart.py` 一处**：三边都要用，而 `chart` 谁都不依赖
+（`constraints` import `split`、`report` import `split`，都不能当共同底座）。
+
+`Scoring.isolates` 的四个调用点 —— **少一个都会漏**：
+
+- `hold_tail_hand`：隔离组的长条不钉组外的键；
+- `hold_conflict`：隔离组的长条不挡组外的键；
+- `_conflict_holds`（→ `hold_conflict_cost`）：不对组外收占手代价；
+- `move_cost`：隔离组的长条**不当占手**，占手效应不外溢。
+
+`constraints.py` 另有三处：规则 2 的「同刻起弧」、规则 3 的「区间异手」、
+`_hold_windows` 产出的占手区间。
+`report.analyze` 还有一处：**报告不能再报一次假警报** —— 求解器既然允许组外的键
+与演出长条同手，`长条占手冲突` 就不该把它数进去（实测会多报 2 处）。
+
+`_scan_multi_finger` 走的是**另一套**实现（按组给落点分桶，见 §5），
+它不经过 `isolates`，所以改多指逻辑时别只盯着 `isolates`。
+
+> 这一条修的是实测 bug：`deinosphainein_2` 的 `timinggroup(noinput)` 里有两条
+> 演出用长条（`hold(97263,98526,2)` / `(…,3)`），它们在 98526 那一刻多贡献了两个
+> 地面落点，把普通配置顶到阈值 3、判成多指段；多指段会**整段无视**
+> "有弧时不得同色"，于是那一刻的正常长条被分成了弧的颜色（R）。
+> 修完组外落点数回到 2，长条正确判成 L。
+
+**安全性**：没有 noinput 组时 `isolates` 恒为 `False`、落点分桶只剩 0 号桶，
+所以普通谱面的行为**逐位不变**（实测同一份合成谱面：代价精确到 9 位小数、
+手标记、多指集合、`forbidden` 全部一致）。
+
+**没做的部分**（有意留着，别当成 bug）：弧的**软**代价（`hand_catch` /
+`hand_release` / `tail_hint`）以及 move/jack 之类的成对代价仍然看得见 noinput 物件。
+这恰恰是让演出物件"融入"的原因 —— 全屏蔽掉它们会随机上色，就是用户不想要的突兀。
+
 ---
 
 ## 5. 多指段：预扫描 `_scan_multi_finger`
@@ -451,14 +524,21 @@ y 方向：`y = 1.61` 在 4k 刻度下是 `525px`，在 6k 刻度下是 `326px` 
 时刻 -> 该时刻的判定物件      # ±SAME_HAND_MARGIN_MS 内并成同一时刻
 + 仍在按住的长条落点           # start <= time <= end
 + 实体弧在**这一刻的采样点**   # lo <= time <= hi，长度无关
-= spots（按 _spot() 去重）
+= spots（按 _spot() 去重，**并且按 noinput 组号分桶**）
 if len(spots) >= multi_finger_min(3): 该组进入多指模式
 ```
+
+落点是**按组分桶**的（0 号桶 = 组外）：
+
+- 组外的键只看 0 号桶 —— 隔离组的装饰物件不得把普通配置抬成多指段；
+- 隔离组的键看 `0 号桶 | 本组桶` —— 它仍然受组外影响（见 §4.6）。
+
+没有 noinput 组时只剩 0 号桶，行为与"分桶之前"完全一致。
 
 **四个必须记住的细节**：
 
 1. **落在同一个点只算一根手指**。重复计数会把普通配置误判成多指段。
-2. **同一只手的多条弧只算一个触点**（`arc_hand_counted`）。
+2. **同一只手的多条弧只算一个触点**（`arc_hand_counted`，按组各记一份）。
    否则"1 个键 + 2 条同色弧"会被数成 3 个触点 → 误抬成多指段 →
    而多指段会整段无视"有弧时不得同色"这条硬约束。**这是用户报告过的真实 bug。**
 3. **黑线（`arctype=true`）不参与**：`color` 是占位符、没有语义。
@@ -504,6 +584,10 @@ if len(spots) >= multi_finger_min(3): 该组进入多指模式
 
 `own_spots` 用 `id(arc)` 做键 —— `AffArc` 是普通 dataclass（`eq=True`），
 所以用 `id()` 而不是对象本身，避免结构相同的两条弧互相干扰。
+
+**隔离组的弧/长条不参与这三条规则对"组外"的判定**（`_isolated`，见 §4.6）。
+实测 bug 就是组外的长条被装饰弧带着走：`deinosphainein_2` 98526 处，
+正常长条本应判 L，却因为多指段放行而跟着弧色判成了 R。
 
 ---
 
@@ -557,7 +641,7 @@ _TUNABLE_RANGES = {"cost.jack": (0.0, 500.0), "cost.move": (0.0, 100.0)}
 ### 8.1 自测
 
 ```bash
-python3 -m unittest discover -s py/tests     # 84 条，0 skip，约 0.04s
+python3 -m unittest discover -s py/tests     # 112 条，0 skip，约 0.16s
 ```
 
 **全部自足**：不需要任何仓库外的谱面文件，整个包可以独立跑通。
@@ -588,7 +672,7 @@ python3 -m unittest discover -s py/tests     # 84 条，0 skip，约 0.04s
 2. 所有判定物件都标了手（`result.counts()["none"] == 0`）；
 3. **违反硬约束 0 处**（`constraints.allowed_hands` 全覆盖）；
 4. **重复处理幂等**（对输出再跑一次，结果逐字节相同）；
-5. 自测全绿（84 条 / 0 skip）。
+5. 自测全绿（112 条 / 0 skip）。
 
 > 上面 1–4 条在**大谱面**上仍然值得手工过一遍：自测是合成小谱，
 > 抓不到"真实谱面里长尾组合"的问题。手边的 `halcyon_2` / `gengaozo_2` /
@@ -676,6 +760,36 @@ python3 tools/compare.py 谱面 参考                 # 自动锁定观察区�
 改一处就要改三处 —— 这是有意的冗余（"不值得赌被绕过"），
 但**新增检查时不要漏**。
 
+> 注意：这是**尾指同手**那条规则的冗余。它的兄弟规则"**长条占手**"（区间内
+> 不得同手）**刻意不做冗余** —— `_refine` 已被 `_hold_extended_stop` 堵死
+> （§2.4），再加一个事后收口 pass 就是死代码了。两条规则的处理方式不同，
+> 别照搬。
+
+### 9.4b 长条尾指同刻：`>=` 不是 `>`
+
+`move_cost` 里"手被长条占住"的判据是 `tail >= second.time`（**含同刻**）。
+
+尾指同刻只有两种可能，都不是"移动"：
+
+- **原地**（`arc` 尾原地 tap 那种）：手就在那儿，松手即按下 —— 合法且免费，
+  `hold_tail_hand` 正要求它同手；
+- **别处**：手要同时在两处 —— 不合理，由 `hold_conflict_cost` 收 `busy`。
+
+曾经写成 `tail > second.time`，于是**恰好同刻**时不返回 0，落到下面
+"释放点压在键上 → `return 40.0`" 的分支。那个分支原本是给**音弧**准备的
+（弧尾必须跟到，同刻确实做不到），对 hold 却白收 40.0，而且和 `busy` **重复收费**
+（同手 total 64 而非 20）。实测 `deinosphainin_3` 因此虚高 80.0。
+
+> 症状很难自己发现：那 40.0 是**有界的软惩罚**，不会让解非法、也不会报无解，
+> 只是让求解器在这些点上偏向错误答案。`-1/-2ms` 反而正常（它们在更上面的
+> `tail > time` 就返回 0 了），**只有恰好同刻**这一个点例外 ——
+> 偏移 −2/−1/0/+1/+2 里，只有 0 是坏的。
+> `HoldTailInstantTest` 盯着这条（把 `>=` 改回 `>` 会有 4 条测试变红）。
+
+改这里时注意 `_conflict_holds`（line 260 附近）用的是**另一套**判据，
+它已经正确地把"结尾同刻、落在**别的位置**"算作冲突、
+把"尾指本应对齐的键"排除在外（靠 `_same_pos`）。两边口径要一起看。
+
 ### 9.5 报告口径（已修正，勿回退）
 
 **两条口径，改动 `report.py` 前必读：**
@@ -731,6 +845,34 @@ python3 tools/compare.py 谱面 参考                 # 自动锁定观察区�
   若用全局 `physics.pixel_per_unit_x` 换算，**同样的几何位移会被报成不同轨道数**
   （`test_report_units_follow_six_lane_scale` 盯着这条）。
   所以 `MoveRecord` 逐条记录 `unit_px_x`，`analyze()` 汇总时也按每条自己的刻度算。
+
+**(4) 位置一律用「时刻」，不用行号。** `MoveRecord` / `GapRecord` / `Spot`
+都带 ms 时刻（`describe()` 输出 `101808-101967` 这种）。行号只在编辑器里有意义，
+玩家是按时间找位置的。`MoveRecord` 仍保留 `from_line`/`to_line`
+（调试时有用），但**默认不打印**。
+
+**(5) 排行榜与占手判据都要遵守 `SAME_HAND_MARGIN_MS`（= 2ms）。**
+谱面里常见 1ms 错位和弦（如 53051 的 arctap 配 53052 的 hold），
+求解器已把它当**同一个和弦时刻**处理，报告必须一致，否则会出现假读数：
+
+| 位置 | 曾经的假读数 | 现在的判据 |
+| --- | --- | --- |
+| 手速榜 | `BPM 15000` | `gap > SAME_HAND_MARGIN_MS` |
+| 位移榜 | `1216 轨道/秒` | `delta_t > SAME_HAND_MARGIN_MS` |
+| 长条占手 | 1ms 重叠也报冲突 | `duration > delta_t + SAME_HAND_MARGIN_MS` |
+
+这三个都是**先有数据、后发现的既有问题**（不是引入时就有），
+`ChordMarginTest` / `test_hold_conflict_ignores_margin` 盯着它们。
+
+> 注意"长条占手"的 `delta_t` 是**长条头 → 下一个键**，不是"尾 → 下一个键"。
+> 写文案时别说成"N ms 后就要按键"（那会被读成从尾算），
+> 要说清**长条区间**与**下一个键的时刻**，以及**重叠了多少**。
+
+**(6) 注意点要能定位。** `Stats.warnings` 是 `list[Warning]`，
+每条可带 `spots: list[Spot]`（最多显示 `WARNING_SPOT_LIMIT = 5` 处，
+其余折成"还有 N 处未列出"）。只报计数的警告读者无法回查。
+求解器给的 `result.warnings` 仍是纯字符串，`aff_cli` 渲染时用
+`hasattr(note, "lines")` 区分两者。
 
 `_report_lines` 里有一处局部 import（`from dataclasses import replace`）
 在 `_replace_sides` 内部 —— 无害但可以提到文件顶部。
@@ -793,7 +935,7 @@ python3 tools/compare.py 谱面 参考                 # 自动锁定观察区�
 
 ## 12. 开发流程建议
 
-1. **改之前**先跑一次 `unittest discover`，确认是 **84 条 / 0 skip** 全绿，
+1. **改之前**先跑一次 `unittest discover`，确认是 **112 条 / 0 skip** 全绿，
    记下当前状态再动手（自测全部自足，不需要任何外部谱面）。
 2. 用小谱面（`TINY_AFF` / 直接构造 `Note`）构造**最小复现**，
    再用真实谱面确认没有回归。

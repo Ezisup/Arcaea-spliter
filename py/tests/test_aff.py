@@ -34,7 +34,10 @@ from spliter.aff import (                                    # noqa: E402
     x_to_lane,
 )
 from spliter.constraints import build_arc_constraints        # noqa: E402
-from spliter.split import Scoring, screen_span, split         # noqa: E402
+from spliter.split import (Scoring, SAME_HAND_MARGIN_MS,      # noqa: E402
+                           _feasible, _feasible_region,
+                           _hold_extended_stop, delta, screen_span, split)
+from spliter.report import analyze                            # noqa: E402
 
 #: 一个自足的小 AFF：含 tap / hold / 实体弧 / 黑线 + arctap。
 TINY_AFF = """AudioOffset:12
@@ -317,6 +320,57 @@ class ConstraintTest(unittest.TestCase):
         hands = sorted(result.hands[i] for i in arctaps)
         self.assertEqual(hands, ["L", "R"],
                          "两个天键必须按各自弧色分到不同手（右色弧在左边也一样）")
+
+    def test_delta_matches_evaluate_on_every_single_flip(self) -> None:
+        """``delta`` 是局部搜索的评分器，任何改动下都必须与 ``evaluate`` 一致。
+
+        复现过的 bug：向右扩段的循环从 ``hi`` 起算，把**被改的键自己**也算成
+        "这只手又出现了一次"，于是段尾停在"另一只手的第一个键"上，漏掉同一只手的
+        下一个键 —— 而那一条的 move 恰好以被改的键为 previous（实测差 39.9）。
+        下面这张小谱就靠"右手只有一个键、且它在 L 连续三个键之后"来触发。
+        """
+        text = ("-\n"
+                "(1000,1,0);\n"
+                "(1200,1,0);\n"
+                "(1400,1,0);\n"
+                "(1600,1,0);\n"
+                "(2000,3,1);\n"
+                "(3000,2,0);\n")
+        parsed = parse_aff(text)
+        notes = parsed.chart.notes
+        config = Config()
+        apply_arcaea_physics(config)
+        constraints = build_arc_constraints(parsed, notes)
+        scoring = Scoring(notes, config, parsed.chart.meta, constraints)
+        result = split(notes, config, parsed.chart.meta, constraints=constraints)
+        hands = list(result.hands)
+        scoring._last_hands = hands
+        base = scoring.evaluate(hands)
+        checked = 0
+        for index in range(len(notes)):
+            if scoring.is_locked(index) or hands[index] not in ("L", "R"):
+                continue
+            other = "R" if hands[index] == "L" else "L"
+            flipped = list(hands)
+            flipped[index] = other
+            want = scoring.evaluate(flipped).total
+            got = delta(scoring, flipped, [index], base).total
+            self.assertAlmostEqual(
+                want, got, places=6,
+                msg=f"物件 {index}（t={notes[index].time}）翻转时 delta 与 evaluate 不一致")
+            checked += 1
+        self.assertGreater(checked, 3, "这个用例应当检查到多个翻转")
+        # 相邻两个物件一起翻（局部搜索也会这么走）
+        for index in range(len(notes) - 1):
+            if scoring.is_locked(index) or scoring.is_locked(index + 1):
+                continue
+            flipped = list(hands)
+            for j in (index, index + 1):
+                flipped[j] = "R" if flipped[j] == "L" else "L"
+            want = scoring.evaluate(flipped).total
+            got = delta(scoring, flipped, [index, index + 1], base).total
+            self.assertAlmostEqual(want, got, places=6,
+                                   msg=f"相邻 {index},{index+1} 同时翻转时不一致")
 
     def test_same_start_other_place_is_other_hand(self) -> None:
         """同刻但**不在同一个点** -> 不能算"同一次落指"，应判成异手。
@@ -659,15 +713,20 @@ class PointArcAndMultiFingerTest(unittest.TestCase):
                          "多指配置不该被报成『三押按不下』")
 
     def test_multi_finger_arc_sample_point_is_not_a_blocker(self) -> None:
-        """多指段里弧只按采样点排序，不再"区间异手"压住别的键。"""
+        """多指段里弧只按采样点排序，不再"区间异手"压住别的键。
+
+        三个地面键先按 x 分成左半 2 个（L）、右半 1 个（R）；但**天上的弧
+        （色 0 = 左手）也算一个触点**，那样左手 3 点、右手 1 点 —— 差值到 2
+        就不合理了，会被"两手持点数之差不得超过 1"拉平（左手里最靠右的那个
+        改判给右手）。冲突时数量规则优先于"同 y 左右排列"。
+        """
         text = ("-\n"
                 "arc(1000,3000,0.00,0.00,s,1.00,1.00,0,none,false);\n"
                 "(1000,1);\n(1000,2);\n(1000,3);\n")
         parsed, constraints, result = self._run(text)
         self.assertTrue(result.scoring.multi_finger_times)
-        # 三个地面键（x = -0.25 / 0.25 / 0.75）+ 天上的弧采样点：地面那一层
-        # 按 x 分左右两半（3 个 -> 左半 2 个 L、右半 1 个 R），弧不参与地面层
-        self.assertEqual(result.hands[:3], ["L", "L", "R"])
+        self.assertEqual(result.hands[:3], ["L", "R", "R"],
+                         "弧占住左手一个触点后，两手持点数必须拉平到 2:2")
 
     def test_one_ms_offset_chord_is_one_moment(self) -> None:
         """1ms 错位和弦（tap + 晚 1ms 的 hold）要按**同一个时刻**分左右。
@@ -1210,6 +1269,431 @@ class SpeedRankTest(unittest.TestCase):
                            from_time=100, to_time=350)
         text = record.describe(2, tied=1)
         self.assertEqual(text, "第二名, 间隔 250ms, 相当于 BPM 120 的 8 分音符, 100-350")
+
+
+class WarningLocationTest(unittest.TestCase):
+    """注意点必须给得出**位置**，不能只报一个计数。
+
+    另外两个口径：排行榜与"长条占手"都要遵守项目既有的
+    ``SAME_HAND_MARGIN_MS``（≤2ms 视为同一和弦时刻）。
+    """
+
+    def _config(self):
+        config = Config()
+        apply_arcaea_physics(config)
+        return config
+
+    def _hold_case(self, duration: int, next_time: int):
+        notes = [
+            Note(time=0, x=-0.25, y=0.0, type="hold", side="L", line=4,
+                 params={"duration": str(duration)}),
+            Note(time=next_time, x=-0.25, y=0.0, type="tap", side="L", line=5),
+            Note(time=next_time + 500, x=0.25, y=0.0, type="tap", side="R", line=6),
+        ]
+        return analyze(notes, self._config())
+
+    def test_hold_conflict_reports_location(self) -> None:
+        """真冲突要能定位到两端的时刻。"""
+        stats = self._hold_case(duration=900, next_time=700)
+        self.assertEqual(stats.hold_blocked, 1)
+        warnings = [w for w in stats.warnings if "长条" in w.text]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(len(warnings[0].spots), 1, "必须给出具体位置")
+        text = warnings[0].lines()[1]
+        self.assertIn("0~900", text)
+        self.assertIn("700", text)
+
+    def test_hold_conflict_ignores_margin(self) -> None:
+        """重叠 ≤ SAME_HAND_MARGIN_MS 是同一个和弦时刻，不算冲突。"""
+        for overlap in (1, 2):
+            stats = self._hold_case(duration=900 + overlap, next_time=900)
+            self.assertEqual(stats.hold_blocked, 0,
+                             f"重叠 {overlap}ms 不该算冲突")
+
+    def test_hold_conflict_beyond_margin_still_detected(self) -> None:
+        """刚超过容差就要报（防止把判据改得太松）。"""
+        stats = self._hold_case(duration=903, next_time=900)
+        self.assertEqual(stats.hold_blocked, 1, "重叠 3ms 应算冲突")
+
+    def test_warning_renders_all_spots_with_fold(self) -> None:
+        """位置多时只列前几处，并说明还有多少。"""
+        from spliter.report import Spot, Warning
+        spots = [Spot(time=i * 100, text=f"时刻 {i * 100}") for i in range(8)]
+        warning = Warning("有 8 处问题", spots, limit=5)
+        rows = warning.lines()
+        self.assertEqual(len(rows), 7, "1 行结论 + 5 处 + 1 行折叠说明")
+        self.assertIn("还有 3 处未列出", rows[-1])
+
+    def test_warning_without_spots_renders_one_line(self) -> None:
+        from spliter.report import Warning
+        rows = Warning("仍有 3 个物件没有标记").lines()
+        self.assertEqual(rows, ["仍有 3 个物件没有标记"])
+
+
+class ChordMarginTest(unittest.TestCase):
+    """1ms 错位和弦（谱面常写）不能进排行榜。
+
+    它是**一个和弦**，不是"这个手指再落一次"，也不是一次"移动"。
+    曾经没过滤，手速榜报出 BPM 15000、位移榜报出 1216 轨道/秒。
+    """
+
+    def _config(self):
+        config = Config()
+        apply_arcaea_physics(config)
+        return config
+
+    def test_offset_chord_not_in_speed_rank(self) -> None:
+        """同手 1ms 错位（如 arctap 53051 + hold 53052）不进手速榜。"""
+        notes = [
+            Note(time=53051, x=0.25, y=1.0, type="arctap", side="L", line=1),
+            Note(time=53052, x=0.25, y=0.0, type="hold", side="L", line=2,
+                 params={"duration": "200"}),
+            Note(time=53200, x=0.25, y=0.0, type="tap", side="L", line=3),
+        ]
+        stats = analyze(notes, self._config())
+        self.assertTrue(all(g.gap_ms > SAME_HAND_MARGIN_MS
+                            for g in stats.fastest_gaps),
+                        "错位和弦不该出现在手速榜里")
+        self.assertEqual(stats.fastest_gap_ms, 53200 - 53052)
+
+    def test_offset_chord_not_a_move(self) -> None:
+        """同理不进位移榜（否则会出现 1216 轨道/秒 这种读数）。"""
+        notes = [
+            Note(time=53051, x=0.25, y=1.0, type="arctap", side="L", line=1),
+            Note(time=53052, x=0.25, y=0.0, type="hold", side="L", line=2,
+                 params={"duration": "200"}),
+            Note(time=53200, x=0.25, y=0.0, type="tap", side="L", line=3),
+        ]
+        stats = analyze(notes, self._config())
+        self.assertTrue(all(m.delta_t > SAME_HAND_MARGIN_MS
+                            for m in stats.hard_moves),
+                        "错位和弦不该算一次移动")
+        self.assertEqual(stats.over_max_speed, 0)
+
+
+class HoldTailInstantTest(unittest.TestCase):
+    """长条**尾指同刻**必须与"按住期间"同样处理（不做位移判定）。
+
+    曾经的 bug：`move_cost` 里判据写成 ``tail > second.time``，
+    于是"恰好同刻"落进了下面"释放点压在键上"的分支，白收 40.0。
+    那笔 40.0 本来是给**音弧**尾同刻准备的（弧尾必须跟到，同刻确实做不到），
+    对 hold 却是最常见的正常交接。
+
+    同刻有两种，性质完全不同：
+
+    - **原地**（arc 尾原地 tap 那种）：手就在那儿，松手即按下 —— 合法、免费；
+    - **别处**：手要同时在两处 —— 不合理，由 ``hold_conflict_cost`` 收 busy。
+    """
+
+    def _config(self):
+        config = Config()
+        apply_arcaea_physics(config)
+        return config
+
+    def _pair(self, key_x: float, duration: int = 1000, key_time: int | None = None):
+        hold = Note(time=0, x=-0.25, y=0.0, type="hold",
+                    params={"end": duration, "duration": duration})
+        tap = Note(time=duration if key_time is None else key_time,
+                   x=key_x, y=0.0, type="tap")
+        return Scoring([hold, tap], self._config()), hold, tap
+
+    def test_tail_instant_same_position_is_free(self) -> None:
+        """同刻 + 原地：不该收那笔 40.0（手本来就在那儿）。"""
+        scoring, _hold, _tap = self._pair(key_x=-0.25)
+        self.assertEqual(scoring.move_cost(0, 1, "L"), 0.0,
+                         "尾指同刻的原地键不是一次移动")
+
+    def test_tail_instant_other_position_is_not_a_move_either(self) -> None:
+        """同刻 + 别处：同样不做位移判定（与 -1/-2ms 一致）。"""
+        scoring, _hold, _tap = self._pair(key_x=0.25)
+        self.assertEqual(scoring.move_cost(0, 1, "L"), 0.0,
+                         "手被钉住时不做位移判定，代价由 busy 收")
+
+    def test_tail_instant_other_position_charged_once(self) -> None:
+        """同刻 + 别处：冲突代价只由 busy 收一次，不再叠加那笔 40.0。"""
+        scoring, _hold, _tap = self._pair(key_x=0.25)
+        same = scoring.evaluate(["L", "L"])
+        other = scoring.evaluate(["L", "R"])
+        # 关键：两边都不该出现"位移"（同刻没有移动过程）
+        self.assertEqual(same.move, 0.0)
+        self.assertEqual(other.move, 0.0)
+        # 冲突只体现为 busy，且只收一次
+        self.assertAlmostEqual(same.busy, scoring.cost.busy, places=6)
+        self.assertEqual(other.busy, 0.0)
+
+    def test_offsets_minus2_to_plus2_agree(self) -> None:
+        """长条尾前后 ±2ms 应当得到同样的位移代价（曾经只有 0 例外）。"""
+        costs = []
+        for offset in (-2, -1, 0, 1, 2):
+            scoring, _hold, _tap = self._pair(key_x=-0.25,
+                                              key_time=1000 + offset)
+            costs.append(scoring.move_cost(0, 1, "L"))
+        self.assertEqual(len(set(costs)), 1,
+                         f"±2ms 内的位移代价应当一致，实际 {costs}")
+
+    def test_tail_instant_still_requires_same_hand(self) -> None:
+        """同刻 + 原地仍必须同手（硬约束不许换手）。"""
+        scoring, _hold, _tap = self._pair(key_x=-0.25)
+        self.assertEqual(scoring.hold_tail_hand(1, ["L", "L"]), "L")
+        self.assertFalse(_feasible(scoring, ["L", "R"], 1),
+                         "尾指同刻换手应当非法")
+
+    def test_tail_instant_other_position_allows_hand_switch(self) -> None:
+        """同刻 + 别处：允许换手（换手才是正解）。"""
+        scoring, _hold, _tap = self._pair(key_x=0.25)
+        self.assertIsNone(scoring.hold_tail_hand(1, ["L", "L"]))
+        self.assertTrue(_feasible(scoring, ["L", "R"], 1))
+
+
+class NoinputIsolationTest(unittest.TestCase):
+    """``timinggroup(noinput)`` 的**隔离**语义。
+
+    noinput 是演出组：里面的物件不受玩家输入，但仍要**上手标记**
+    （否则一堆拆好的键里冒出两个原色会很突兀）。所以取折中：
+
+    - 组内物件**可以**受组外、以及**本组**的影响；
+    - 组内物件**不能**影响组外。
+
+    这里修的是：装饰长条让普通配置的落点数超过阈值、被判成"多指段"，
+    而多指段会整段无视"有弧时不得同色"等硬约束 ——
+    实测 deinosphainein_2 的 98526 处，普通长条因此被分成了弧的颜色。
+    """
+
+    #: 组外 2 个落点 + 组内 2 个落点；阈值 3。
+    #: 只看组外 = 2（普通配置），连组内一起看 = 4（真多指）。
+    CHART = "\n".join([
+        "AudioOffset:0",
+        "-",
+        "timing(0,150.00,4.00);",
+        "hold(0,1000,1);",
+        "(500,2);",
+        "timinggroup(noinput){",
+        "  hold(0,1000,3);",
+        "  (500,4);",
+        "};",
+        "(1500,1);",
+    ]) + "\n"
+
+    #: 同样的几何，但**不分组**：t=500 处确实有 4 个落点（对照组）。
+    CONTROL = "\n".join([
+        "AudioOffset:0",
+        "-",
+        "timing(0,150.00,4.00);",
+        "hold(0,1000,1);",
+        "(500,2);",
+        "hold(0,1000,3);",
+        "(500,4);",
+        "(1500,1);",
+    ]) + "\n"
+
+    #: 组内一条弧盖住组外的键（该弧不该限制组外的手）。
+    ARC_CHART = "\n".join([
+        "AudioOffset:0",
+        "-",
+        "timing(0,150.00,4.00);",
+        "timinggroup(noinput){",
+        "  arc(0,2000,0.00,0.00,s,1.00,1.00,1,none,false);",
+        "};",
+        "(1000,3);",
+    ]) + "\n"
+
+    def _config(self):
+        config = Config()
+        apply_arcaea_physics(config)
+        return config
+
+    def _scoring(self, text):
+        parsed = parse_aff(text)
+        notes = sorted(parsed.chart.notes, key=lambda n: n.time)
+        config = self._config()
+        constraints = build_arc_constraints(parsed, notes)
+        scoring = Scoring(notes, config, parsed.chart.meta,
+                          constraints=constraints)
+        return parsed, notes, scoring
+
+    def _index_at(self, notes, time, x):
+        for index, note in enumerate(notes):
+            if note.time == time and abs(note.x - x) < 1e-9:
+                return index
+        raise AssertionError(f"找不到 t={time} x={x:+.2f} 的物件")
+
+    def test_parser_tags_noinput_group(self) -> None:
+        """组号要落在**组内**那两个物件上，组外一律为 0。"""
+        _parsed, notes, _scoring = self._scoring(self.CHART)
+        tagged = sorted((n.time, n.x) for n in notes if n.noinput)
+        self.assertEqual(tagged, [(0, 0.75), (500, 1.25)])
+        self.assertTrue(all(n.noinput == 1 for n in notes if n.noinput))
+        self.assertTrue(all(n.noinput == 0 for n in notes if not n.noinput))
+
+    def test_noinput_does_not_inflate_multi_finger(self) -> None:
+        """组外的键只看组外落点：2 个 < 阈值 3，不该被抬成多指段。"""
+        _parsed, notes, scoring = self._scoring(self.CHART)
+        index = self._index_at(notes, 500, 0.25)
+        self.assertNotIn(index, scoring.multi_finger)
+
+    def test_noinput_still_receives_outside_influence(self) -> None:
+        """组内的键能受组外影响：2 + 2 = 4 >= 3，应当是多指配置。"""
+        _parsed, notes, scoring = self._scoring(self.CHART)
+        index = self._index_at(notes, 500, 1.25)
+        self.assertIn(index, scoring.multi_finger)
+
+    def test_control_without_grouping_does_trigger(self) -> None:
+        """对照组：不分组时 t=500 有 4 个落点，组外的键也会被判多指。"""
+        _parsed, notes, scoring = self._scoring(self.CONTROL)
+        index = self._index_at(notes, 500, 0.25)
+        self.assertIn(index, scoring.multi_finger)
+
+    def test_noinput_hold_does_not_block_outside_hand(self) -> None:
+        """组内长条不挡组外的键（组外那个键可以随便用哪只手）。"""
+        scoring = Scoring([
+            Note(time=0, x=-0.25, y=0.0, type="hold", noinput=1,
+                 params={"end": 1000, "duration": 1000}),
+            Note(time=500, x=-0.25, y=0.0, type="tap"),
+        ], self._config())
+        self.assertFalse(scoring.hold_conflict(1, "L", ["L", "L"]))
+
+    def test_ordinary_hold_does_block_same_hand(self) -> None:
+        """对照组：普通长条**必须**挡住区间内同手的键（隔离不能把这条关掉）。"""
+        scoring = Scoring([
+            Note(time=0, x=-0.25, y=0.0, type="hold",
+                 params={"end": 1000, "duration": 1000}),
+            Note(time=500, x=-0.25, y=0.0, type="tap"),
+        ], self._config())
+        self.assertTrue(scoring.hold_conflict(1, "L", ["L", "L"]))
+
+    def test_noinput_arc_does_not_constrain_outside_note(self) -> None:
+        """组内的弧不限制组外的键（否则组外的手标记会被装饰弧带着走）。"""
+        parsed, notes, _scoring = self._scoring(self.ARC_CHART)
+        constraints = build_arc_constraints(parsed, notes)
+        outside = self._index_at(notes, 1000, 0.75)
+        self.assertEqual(constraints.forbidden_hands(outside), set())
+
+    def test_same_arc_outside_group_still_constrains(self) -> None:
+        """对照组：同样的弧放在组外，就会限制那个键。"""
+        text = "\n".join([
+            "AudioOffset:0",
+            "-",
+            "timing(0,150.00,4.00);",
+            "arc(0,2000,0.00,0.00,s,1.00,1.00,1,none,false);",
+            "(1000,3);",
+        ]) + "\n"
+        parsed = parse_aff(text)
+        notes = sorted(parsed.chart.notes, key=lambda n: n.time)
+        constraints = build_arc_constraints(parsed, notes)
+        outside = self._index_at(notes, 1000, 0.75)
+        self.assertEqual(constraints.forbidden_hands(outside), {"R"})
+
+    def _hold_with_key(self, noinput: int):
+        """一条长条 + 区间内一个同手的键（报告应当/不该报冲突）。"""
+        return [
+            Note(time=0, x=-0.25, y=0.0, type="hold", side="L", noinput=noinput,
+                 params={"end": 1000, "duration": 1000}),
+            Note(time=500, x=0.25, y=0.0, type="tap", side="L"),
+        ]
+
+    def test_report_ignores_noinput_hold(self) -> None:
+        """报告不该把"组外键与演出长条同手"报成占手冲突 —— 那是假警报。"""
+        stats = analyze(self._hold_with_key(noinput=1), self._config())
+        self.assertEqual(stats.hold_blocked, 0)
+
+    def test_report_still_flags_ordinary_hold(self) -> None:
+        """对照组：普通长条占手**必须**照报（隔离不能把这条也关掉）。"""
+        stats = analyze(self._hold_with_key(noinput=0), self._config())
+        self.assertEqual(stats.hold_blocked, 1)
+
+    def test_noinput_notes_still_get_hand_markers(self) -> None:
+        """折中的另一半：组内物件**照样要拆**，不能留成原色。"""
+        parsed, notes, _scoring = self._scoring(self.CHART)
+        constraints = build_arc_constraints(parsed, notes)
+        result = split(notes, self._config(), parsed.chart.meta,
+                       constraints=constraints)
+        self.assertTrue(all(hand in ("L", "R") for hand in result.hands),
+                        f"不该有未标记的物件：{result.hands}")
+        for index, note in enumerate(notes):
+            if note.noinput:
+                self.assertIn(result.hands[index], ("L", "R"))
+
+
+class HoldOccupancyTest(unittest.TestCase):
+    """「长条占手」必须在最终结果里成立。
+
+    实测 bug（``cc_test.txt`` 109833 / 113166）：波束搜索给的是对的
+    （``hold=R, tap=L``），却被局部优化 ``_refine`` 翻成了 ``hold=L, tap=L``。
+    两个条件缺一不可：
+
+    1. ``_feasible`` 只查"被翻物件**自己那一刻**的组"，而长条换手会牵动**整个
+       占手区间** —— 它和区间**后面**某个键撞成同手时查不出来；
+    2. 那种 167ms 的短长条（< ``hold_min_duration`` = 260）在**权重侧**不算占手，
+       于是"翻过去"不花任何代价，局部优化就会去翻。
+
+    修法是扩展可行性检查的区间（``_hold_extended_stop``）：区域里每条长条的
+    占手区间都并进来一起查。四种邻域（单键翻转 / 窗口交换 / 邻近交换 /
+    前缀翻转 / 整段镜像）全部经过 `_feasible` / `_feasible_region`，所以
+    ``_refine`` 从此不可能再产出违规。
+    """
+
+    #: 长条 + **尾指同刻、另一条轨道**的单键：必须两只手。
+    TAIL_CHART = "\n".join([
+        "AudioOffset:0",
+        "-",
+        "timing(0,180.00,5.00);",
+        "hold(0,167,2);",
+        "(167,3);",
+        "(334,1);",
+        "(501,4);",
+    ]) + "\n"
+
+    def _config(self):
+        config = Config()
+        apply_arcaea_physics(config)
+        return config
+
+    def _pair(self):
+        """一条长条 + 它尾指同刻、另一条轨道的键。"""
+        hold = Note(time=0, x=-0.25, y=0.0, type="hold",
+                    params={"end": 1000, "duration": 1000})
+        key = Note(time=1000, x=0.25, y=0.0, type="tap")
+        return Scoring([hold, key], self._config())
+
+    def test_region_extends_over_hold_interval(self) -> None:
+        """只给长条那一刻的区间，也要把区间后面的键一起查。"""
+        scoring = self._pair()
+        hold_slot = scoring._order_of[0]
+        self.assertEqual(_hold_extended_stop(scoring, hold_slot, hold_slot + 1), 2)
+
+    def test_feasible_region_rejects_hold_conflict_outside_region(self) -> None:
+        """把长条翻到与区间后面的键同手，必须判不可行。"""
+        scoring = self._pair()
+        hold_slot = scoring._order_of[0]
+        self.assertFalse(_feasible_region(scoring, ["L", "L"], hold_slot, hold_slot + 1))
+        self.assertTrue(_feasible_region(scoring, ["L", "R"], hold_slot, hold_slot + 1))
+
+    def test_split_output_never_violates_hold_occupancy(self) -> None:
+        """端到端不变式：拆完之后不该存在「长条占手」违规。"""
+        parsed = parse_aff(self.TAIL_CHART)
+        notes = sorted(parsed.chart.notes, key=lambda n: n.time)
+        constraints = build_arc_constraints(parsed, notes)
+        result = split(notes, self._config(), parsed.chart.meta,
+                       constraints=constraints)
+        scoring = result.scoring
+        for index, note in enumerate(notes):
+            hand = result.hands[index]
+            if not hand or index in scoring.multi_finger:
+                continue
+            self.assertFalse(
+                scoring.hold_conflict(index, hand, result.hands),
+                f"第 {note.line} 行（t={note.time}）与长条同手：{hand}")
+
+    def test_tail_instant_key_gets_other_hand(self) -> None:
+        """尾指同刻、另一条轨道的键必须与长条分属两只手。"""
+        parsed = parse_aff(self.TAIL_CHART)
+        notes = sorted(parsed.chart.notes, key=lambda n: n.time)
+        constraints = build_arc_constraints(parsed, notes)
+        result = split(notes, self._config(), parsed.chart.meta,
+                       constraints=constraints)
+        hold = next(i for i, n in enumerate(notes) if n.type == "hold")
+        key = next(i for i, n in enumerate(notes) if n.time == 167)
+        self.assertNotEqual(result.hands[hold], result.hands[key])
 
 
 if __name__ == "__main__":
