@@ -567,7 +567,27 @@ class Scoring:
                 # "同 y 从左到右分左右"，不同键之间的前后关系一律不看。
                 points = outer_points if group == 0 else {
                     **outer_points, **arcs_by_group.get(group, {})}
-                self.multi_hand.update(self._multi_finger_hands(hits, points))
+                if self.physics.multi_hand_pin:
+                    self.multi_hand.update(self._multi_finger_hands(hits, points))
+                else:
+                    # 只保留两类**合法硬钉**：原生 side 标记，以及"骑在实体弧
+                    # 采样点上的键听弧色"（弧色是谱面写死的）。几何分半一律取消，
+                    # 自由键交给代价模型 + "±1 平衡"硬约束。
+                    decided = self._multi_finger_hands(hits, points)
+                    for index in hits:
+                        x, y = self.notes[index].x, self.notes[index].y
+                        if self.sides[index] or _spot(x, y) in points:
+                            self.multi_hand[index] = decided[index]
+                # 该时刻每只手的**弧触点数**（同一只手最多算一个；与判定物件同点的
+                # 不重复计）—— _realizations 的 ±1 平衡硬约束要用。
+                arcs_here = {"L": 0, "R": 0}
+                counted = set()
+                for spot, hand in points.items():
+                    if hand in counted or spot in merged:
+                        continue
+                    counted.add(hand)
+                    arcs_here[hand] += 1
+                self.moment_arcs[time] = arcs_here
                 marked[time] = max(marked.get(time, 0), len(merged))
         self.multi_finger_times = sorted(marked.items())
 
@@ -579,8 +599,10 @@ class Scoring:
         规则（用户口径）：
         - **原生 ``side`` 标记优先**，绝不覆盖（改它就是改谱面）；
         - 每个物件按**绝对左右**定基准（x < 中线 -> 左，否则右）；
-        - **同一个 y 上**有多个触点时，按 x 从左到右分成左右两半（左半 L、右半 R），
-          **实体弧的采样点也在这些触点里**（它在那一刻有一个位置，长度无关）；
+        - **同一个 y 上**有多个判定物件时，按 x 从左到右分成左右两半（左半 L、右半 R）。
+          **实体弧的采样点不参与这个排序** —— 它只用来数"要几根手指"，以及给
+          骑在它身上的键定弧色；让弧占"槽位"会把分半边界顶偏，把明显偏右的键
+          判给左手（用户实测 99666 的 x=0.75 就是这么变成 L 的）；
         - 该 y 上只有一个触点、而这个触点上有实体弧时，直接听弧的颜色 ——
           没有左右可排，弧色是唯一的信息。
 
@@ -609,16 +631,12 @@ class Scoring:
                     out[index] = arc_hand
                     continue
                 points.append((x, None, [index]))
-            # 2) 自由键 + **每只手最多一个**弧占位：同色多条弧不再重复占槽位
-            #    （否则 len(points) 被抬高、左右分半的边界被它们带着漂）。
-            padded: set[str] = set()
-            for spot, hand in arc_points.items():
-                if abs(spot[1] - y) > _LEVEL_EPS or hand in padded:
-                    continue
-                if any(abs(point[0] - spot[0]) <= 1e-6 for point in points):
-                    continue
-                padded.add(hand)
-                points.append((spot[0], hand, []))
+            # 2) **弧的采样点不参与"分左右"**。它们只负责两件事：数"这一刻要
+            #    几根手指"（在 _scan_multi_finger 里）和"骑在弧上的键听弧色"
+            #    （上面第 1 步）。曾经把它们也塞进下面的排序当"占位槽"，结果槽位
+            #    序号被顶偏：y=0 上 [L弧 0.25, 键 0.75, R弧 1.25] 三槽、half=1.5，
+            #    x=0.75 的键落在"槽 1"被判成左手 —— 与绝对/相对位置、手数平衡
+            #    三种判据全都矛盾（用户指出"无论按哪个思路都说不通"）。
             points.sort(key=lambda item: item[0])
             if not points:
                 continue
@@ -630,8 +648,7 @@ class Scoring:
                 for index in members:
                     out[index] = hand
                 continue
-            # 有左右可排：严格按 x 分左右两半。弧的采样点只参与"占位"，
-            # 不在这里拍板（它自己的手由谱面定死，不归我们改）。
+            # 有左右可排：**只看判定物件**，按 x 严格分左右两半。
             half = len(points) / 2.0
             for slot, (_x, _arc_hand, members) in enumerate(points):
                 hand = "L" if slot < half else "R"
@@ -767,6 +784,10 @@ class Scoring:
         """这只手此刻**正按着别处的长条**时，为"同时按两处"收的代价。
 
         代价随"被占住的位置到这个键的距离"增长 —— 手被钉在长条上，越远越勉强。
+
+        但**多指时刻**例外：那一刻手本来就有多根手指可用（拇指按长条、食指打键），
+        收这笔"同时按两处"的账既不符合打法，也会把正确的分法顶掉（用户口径：
+        被"锁"的那只手不能影响后续的自由键）。
         这样"哪只手的长条更近"就成为一个可比较的空间信号（用户人工核对过的
         chaos 谱里，多指段正是按"更近的那条 hold"分的）。
 
@@ -774,6 +795,9 @@ class Scoring:
         才收 —— 否则"让同一只手连着打几个键"就完全免掉了这笔账，而"换手"
         反而因为新手的上一键是 hold 被罚，方向整个反了。
         """
+        if index in self.multi_finger:
+            return 0.0
+
         if index in self.multi_finger:
             return 0.0                        # 多指段：只手被占住这件事不算数
         holds = self._conflict_holds[index]
@@ -869,6 +893,30 @@ class Scoring:
             return None
         return release(hand, t_from, t_to)
 
+    def relationship_previous(self, previous: int | None, current: int,
+                              hand: str) -> int | None:
+        """把"被长条 / 音弧占住的上一个键"视同**不存在**（用户口径）。
+
+        拇指先按住长条、或者这只手刚开始追一条音弧，食指来接后面的自由键 ——
+        这一下没有"相互关系"：``move`` / ``jack`` / ``hardness`` 全部归零，
+        那只手只由**这个键自己的起始位置**决定。之后的自由键则在这条"食指链"
+        上自己结算（前一个自由键就是它的 previous）。
+
+        - 长条：上一个键是**仍按着**的长条（``hold_until >= current``）；
+        - 音弧：这只手在 ``(prev, current]`` 之间**新开始**追一条弧（弧的起点落在
+          区间内）—— 只在"刚进入"这一下生效，弧中间的后续自由键照常结算。
+        """
+        if previous is None:
+            return None
+        if self.hold_until[previous] >= self.notes[current].time:
+            return None
+        arcs = getattr(self.constraints, "arcs_by_hand", None) or {}
+        t_prev, t_now = self.notes[previous].time, self.notes[current].time
+        for arc in arcs.get(hand, ()):
+            if t_prev < min(arc.t1, arc.t2) <= t_now:
+                return None
+        return previous
+
     def move_cost(self, first: int, second: int, hand: str) -> float:
         """从 ``first`` 移到 ``second`` 的代价（这只手）。"""
         notes = self.notes
@@ -905,15 +953,11 @@ class Scoring:
             release_time = tail
         else:
             release_time = notes[first].time
-        # 这只手还扛着音弧：手跟到弧尾，位移要从尾巴算起、时间也只能从弧尾算起。
-        release = self.hand_release(hand, notes[first].time, notes[second].time)
-        if release is not None and release[0] > release_time:
-            release_time, start_x, start_y = release
-        if release_time >= notes[second].time and notes[second].time > notes[first].time:
-            # 释放点正好压在这个键上（弧尾与该键同刻）：手要同时在两处。
-            # 收一笔**有界**的"做不到"代价就返回 —— 否则 travel_time=0 会让
-            # 速度项平方级炸开（实测能到 25 万，把整份谱的判断全压掉）。
-            return 40.0
+        # **不再**把"这只手正扛着音弧"当成位移起点/时间起点（用户口径）：
+        # 拇指追弧，食指照样打键，食指这条链的位移必须从**它自己上一个自由键**
+        # 算起。旧写法把起点强行挪到弧尾，于是正确分法凭空背上巨额 move
+        # （cc_3 90k~110k 实测 10 笔 40 分封顶罚、合计 +391，相位被整体镜像）。
+        # "刚进入弧/长条"那一下由 relationship_previous 归零。
         travel_time = max(notes[second].time - release_time, 0)
 
         # 位移一律用 xy 勾股算屏幕实际距离，不能只看 x。
@@ -1014,6 +1058,7 @@ class Scoring:
         - **密集流里的同键连按** -> 不是 bullet，按 ``jack_time`` 收一笔
           （``spatial`` 在死区内是 0，于是强度就是 ``jack_time``）。
         """
+
         delta_t = self.notes[second].time - self.notes[first].time
         if delta_t <= 0 or delta_t > self.cost.jack_window:
             return 0.0
@@ -1078,6 +1123,7 @@ class Scoring:
         比跑到别处再落一次轻松得多；这里只看时间间隔、**不做** bullet 折扣
         （实测打折会让密集段变差，见 README）。
         """
+
         if self.cost.hardness <= 0:
             return 0.0
         delta_t = self.notes[second].time - self.notes[first].time
@@ -1278,12 +1324,7 @@ _STREAM_ALT_BONUS = 0.3
 #: 所以留成开关，取值以两侧参考的总体表现决定。
 HOLD_ARC_OVERLAP = True
 
-#: 多指段的手标记策略：
-#: ``True``  = 硬钉（历史口径：只看绝对空间 + 同 y 左右分半）
-#: ``False`` = 只钉**原生 side 标记**；其余自由键交给代价模型（双指类似的空间
-#:             罚分）定，并用"两手触点数差 <= 1"作为**硬约束**兜底（用户口径：
-#:             强限制数量差在 ±1 以内就不会出现"一边 3 个一边 1 个"的坏解）。
-MULTI_HAND_PIN = True
+
 
 #: "出张扣分"（``space.reach``）的间隔阈值（ms）：**间隔够大**才收这笔账。
 #: 用户口径就是这个 100ms：时间足够时手来得及换到正确的一侧，出张没有理由；
@@ -1699,7 +1740,8 @@ def _segment_sum(scoring: "Scoring", dense: list[str | None], lo: int, hi: int,
                     index, hand)
             parts.cross += scoring.hand_cross_cost(
                 index, hand, lambda h: group_last.get(h))
-            previous = last_by_hand.get(hand)
+            previous = scoring.relationship_previous(
+                last_by_hand.get(hand), index, hand)
             if previous is not None:
                 parts.move += scoring.move_cost(previous, index, hand)
                 if scoring.may_jack(previous, index):
@@ -2018,7 +2060,33 @@ def _realizations(scoring: Scoring, group: list[int],
             else:
                 options.append([hand for hand in HANDS if scoring.can_hand(index, hand)])
         if all(options):
-            return [list(combo) for combo in product(*options)]
+            arcs_here = scoring.moment_arcs.get(scoring.notes[group[0]].time)
+            reach = scoring.px_to_units(scoring.physics.max_reach)
+            combos: list[list[str]] = []
+            for combo in product(*options):
+                # ① 两手触点数差 <= 1（用户口径的硬限制；含弧触点数）
+                if arcs_here:
+                    counts = dict(arcs_here)
+                    for hand in combo:
+                        if hand in counts:
+                            counts[hand] += 1
+                    if abs(counts.get("L", 0) - counts.get("R", 0)) > 1:
+                        continue
+                # ② 同一只手在同一刻覆盖的跨度不能超过可及范围
+                ok = True
+                for hand in HANDS:
+                    pts = [(scoring.notes[group[slot]].x, scoring.notes[group[slot]].y)
+                           for slot in range(len(group)) if combo[slot] == hand]
+                    if len(pts) > 1:
+                        span = max(screen_span(px - qx, py - qy, scoring.physics)
+                                   for px, py in pts for qx, qy in pts)
+                        if scoring.px_to_units(span) > reach:
+                            ok = False
+                            break
+                if ok:
+                    combos.append(list(combo))
+            if combos:
+                return combos
 
     walk(0, frozenset())
 
@@ -2105,7 +2173,7 @@ def _expand(scoring: Scoring, state: _State, group: list[int], assignment: list[
                 return None                   # 长条尾指处必须同手
         # 换手按"整组"记：组内是同刻按下的，不算换手（见 group_switch_cost）。
         # 束搜索的代价只是排序用的前缀量，这里与 evaluate 保持一致即可。
-        previous = last[hand]
+        previous = scoring.relationship_previous(last[hand], index, hand)
 
         if previous is None:
             # 这只手第一次出手：从起手手位走过去（也要时间，但不算太严格）
