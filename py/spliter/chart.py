@@ -42,7 +42,7 @@ def _to_number(text: str) -> float | None:
 class Note:
     """一个物件。
 
-    ``index`` 是**时间升序**后的序号（0 基），``raw_index`` 是文件里的原始顺序。
+    
     两者可能不同 —— 回写谱面请用物件对象本身（见 :func:`serialize_chart`），
     不要用 ``index`` 去对齐行。
     """
@@ -60,7 +60,6 @@ class Note:
     line: int = 0                   # 1 基行号
     raw_line: str = ""              # 原始整行（不含换行符）
     index: int = 0                  # 时间升序后的序号
-    raw_index: int = 0              # 文件里的原始顺序
     noinput: int = 0                # 所在 ``timinggroup(noinput)`` 的组号
                                     # （0 = 普通；>0 = 隔离组，见 ``split.Scoring.isolates``）
 

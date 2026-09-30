@@ -1314,9 +1314,6 @@ def _same_pos(x1: float, y1: float, x2: float, y2: float) -> bool:
 #: 弧的采样点做左右排序；`constraints.INT_TO_HAND` 是同一套映射。
 _COLOR_HAND = {0: "L", 1: "R"}
 
-#: 判定"是不是同一高度"（y 相差多少以内算同一层，多指段排序用）。
-_LEVEL_EPS = 0.25
-
 #: **音弧尾巴的延续偏好**（软）：音弧结束之后 ``_TAIL_HINT_MS`` 以内、落在弧尾
 #: 同一个点上的键，交给弧那只手会便宜 ``cost.move × _TAIL_HINT_BONUS``。
 #: 用户口径是"arc 的延续稍微长一点"—— 手指沿弧走到尾部刚松手，同位置的下一个键

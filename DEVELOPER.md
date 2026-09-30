@@ -426,8 +426,7 @@ y 方向：`y = 1.61` 在 4k 刻度下是 `525px`，在 6k 刻度下是 `326px` 
 
 ### 4.2 索引与排序
 
-- `Note.index` 是**时间升序**（`sort_notes` 按 `(time, x)` 排）后的序号；
-  `Note.raw_index` 是文件里的原始顺序。**两者可能不同。**
+- `Note.index` 是**时间升序**（`sort_notes` 按 `(time, x)` 排）后的序号。
   回写用 `Note.line`（1 基行号）或物件对象，**不要用 `index` 对齐行**。
 - `Scoring._order` 是扫描顺序（按时间，组内按 x），`_order_of[index]` 是反向表。
   **`dense` 数组（局部优化用）按 `_order` 索引，`hands` 按 `index` 索引**。
@@ -454,7 +453,6 @@ y 方向：`y = 1.61` 在 4k 刻度下是 `525px`，在 6k 刻度下是 `326px` 
 - `SAME_HAND_MARGIN_MS = 2`：长条区间边界的前后容差；**也是多指段
   "±2ms 内并成同一个时刻"用的同一个容差**。
 - `_spot(x, y)` 把点 `round(_, 3)` 后去重，**多指段数"需要几根手指"用**。
-- `_LEVEL_EPS = 0.25`：多指段里判定"同一高度"（y 相差多少算同一层）。
 
 ### 4.5 AFF 回写的两个硬性要求
 
@@ -724,11 +722,21 @@ python3 tools/compare.py 谱面 参考                 # 自动锁定观察区�
 | --- | --- |
 | `chart.py:57` `Note.params_raw` | 声明后**从未被读写** |
 | `chart.py:59` `Note.side_token` | 同上 |
-| `chart.py:103` `Chart.raw_meta` | 同上 |
-| `split.py:1190-1191` `_CROSS_MUTUAL = _CROSS_STILL = 1.0` | 两个倍率相等，`hand_cross_cost` 里的 `factor` 恒为 1.0。公式还在、注释还在，但**分类没有实际效果** |
-| `split.py:1130` `_LEVEL_EPS` | 用在 `_multi_finger_hands` 的 `abs(spot[1]-y) > _LEVEL_EPS` 过滤，但 `y` 已是 `round(_, 6)` 的分组键，弧采样点也来自同一批坐标 —— 实践上几乎不触发 |
-| `config.py:142` `bullet_stream_tol` | 默认 0 → `is_bullet` 里的规整性分支不进入。注释自己写明"实测**没能区分**" |
-| `config.py:73` `physics.hold_tail_relax` | 默认 0 → `duration - 0` 是 no-op。机制保留（注释解释了为什么回到 0） |
+| `chart.py:104` `Chart.raw_meta` | 同上 |
+| `split.py:1377` `_CROSS_MUTUAL = _CROSS_STILL = 1.0` | 两个倍率相等，`hand_cross_cost` 里的 `factor` 恒为 1.0。公式还在、注释还在，但**分类没有实际效果** |
+| `config.py:167` `bullet_stream_tol` | 默认 0 → `is_bullet` 里的规整性分支不进入。注释自己写明"实测**没能区分**" |
+
+> 本轮已删除（无调用 / 无读写，恢复成本低）：`ReportSummary.summary_line()`、
+> `OutputConfig.header_comment`、`Note.raw_index`、`_LEVEL_EPS`。
+
+### 9.1b 保留但当前无调用（**预留 / 兼容**，不是死代码）
+
+| 位置 | 说明 |
+| --- | --- |
+| `split.py:344` `Scoring.scale_y_at()` | `scale_x_at` 的纵向对称 API（当前只有 x 被 `bias_cost` 用到） |
+| `split.py:884` `Scoring.hand_release()` / `constraints.py:96` | 只被 `physics.arc_release >= 0` 分支调用（默认 -1 = 关闭） |
+| `aff.py:326` `ScaleSchedule.is_enabled()` | docstring 写明"用于报告/调试"，尚未接线 |
+| `aff.py:271` `ARC_UNIT_IN_PX` | 旧名字的兼容别名 |
 
 ### 9.2 默认值使其成为 no-op（有价值但当前不生效）
 

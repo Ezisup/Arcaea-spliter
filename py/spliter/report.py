@@ -278,20 +278,6 @@ class Stats:
         total = self.alternating + self.repeated
         return round(self.alternating / total, 3) if total else None
 
-    def summary_line(self) -> str:
-        """一行紧凑摘要。"""
-        parts = [
-            f"物件 {self.total}",
-            f"L/R/M/无 = {self.L}/{self.R}/{self.M}/{self.none}",
-            f"和弦 {self.chords}",
-            f"抗 {self.same_hand_close}",
-        ]
-        ratio = self.alternation_ratio
-        if ratio is not None:
-            parts.append(f"交互率 {ratio * 100:.0f}%")
-        if self.min_gap is not None:
-            parts.append(f"最小间隔 {self.min_gap}ms")
-        return " | ".join(parts)
 
 
 def analyze(notes: list[Note], config: Config) -> Stats:

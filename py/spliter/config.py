@@ -306,9 +306,6 @@ class OutputConfig:
     side_case: str = "upper"
     """``side`` 的写法：``upper`` / ``lower``。"""
 
-    header_comment: bool = True
-    """是否在输出文件头部插入拆谱统计注释。"""
-
     report_dense_gap: float = 220.0
     """统计"交互率"时认为"高密度"的间隔上限（ms）。"""
 
