@@ -910,6 +910,8 @@ class Scoring:
             return None
         if self.hold_until[previous] >= self.notes[current].time:
             return None
+        if current not in self.multi_finger and self.tail_hint[current] == hand:
+            return None                       # 接续刚收尾的弧：视同没有上一个键
         arcs = getattr(self.constraints, "arcs_by_hand", None) or {}
         t_prev, t_now = self.notes[previous].time, self.notes[current].time
         for arc in arcs.get(hand, ()):
@@ -953,11 +955,23 @@ class Scoring:
             release_time = tail
         else:
             release_time = notes[first].time
-        # **不再**把"这只手正扛着音弧"当成位移起点/时间起点（用户口径）：
+        # **不再**默认把"这只手正扛着音弧"当成位移起点/时间起点（用户口径）：
         # 拇指追弧，食指照样打键，食指这条链的位移必须从**它自己上一个自由键**
         # 算起。旧写法把起点强行挪到弧尾，于是正确分法凭空背上巨额 move
         # （cc_3 90k~110k 实测 10 笔 40 分封顶罚、合计 +391，相位被整体镜像）。
         # "刚进入弧/长条"那一下由 relationship_previous 归零。
+        #
+        # ``physics.arc_release >= 0`` 时把弧尾结算接回来（做 hold 那样的"提前
+        # N ms 松手"实验）：位移/可用时间从弧尾（前移 arc_release 毫秒）算起。
+        # 负值 = 关闭（默认，保持上面那条口径）。
+        if self.physics.arc_release >= 0:
+            release = self.hand_release(hand, notes[first].time, notes[second].time)
+            if release is not None:
+                rt = release[0] - self.physics.arc_release
+                if rt > release_time:
+                    release_time, start_x, start_y = rt, release[1], release[2]
+            if release_time >= notes[second].time and notes[second].time > notes[first].time:
+                return 40.0
         travel_time = max(notes[second].time - release_time, 0)
 
         # 位移一律用 xy 勾股算屏幕实际距离，不能只看 x。

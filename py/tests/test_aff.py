@@ -1403,23 +1403,51 @@ class HoldTailInstantTest(unittest.TestCase):
         self.assertEqual(scoring.move_cost(0, 1, "L"), 0.0,
                          "尾指同刻的原地键不是一次移动")
 
-    def test_tail_instant_other_position_is_not_a_move_either(self) -> None:
-        """同刻 + 别处：同样不做位移判定（与 -1/-2ms 一致）。"""
-        scoring, _hold, _tap = self._pair(key_x=0.25)
-        self.assertEqual(scoring.move_cost(0, 1, "L"), 0.0,
-                         "手被钉住时不做位移判定，代价由 busy 收")
+    def test_tail_instant_other_position_settles_after_early_release(self) -> None:
+        """同刻 + 别处：长条**权重侧**已提前 ``hold_tail_relax`` 松手，位移照常结算。
 
-    def test_tail_instant_other_position_charged_once(self) -> None:
-        """同刻 + 别处：冲突代价只由 busy 收一次，不再叠加那笔 40.0。"""
+        硬约束仍按**真实区间**（尾指同刻不许同手，见下一节用例），但位移侧按
+        "已经松手 ``hold_tail_relax`` 毫秒"结算 —— 这正是用户口径（真占手延续到
+        末尾，位移上提前松手）。这里要守住的是：收到的是**正常位移代价**，
+        而不是那笔"手要同时在两处"的 40.0 封顶罚。
+        """
+        scoring, _hold, _tap = self._pair(key_x=0.25)
+        cost = scoring.move_cost(0, 1, "L")
+        self.assertGreater(cost, 0.0, "提前松手后应当照常结算位移")
+        self.assertLess(cost, 40.0, "不该是 40.0 封顶罚")
+
+    def test_tail_instant_other_position_with_zero_relax_is_free(self) -> None:
+        """对照：``hold_tail_relax=0`` 时尾时刻仍不做位移判定（旧口径）。"""
+        config = self._config()
+        config.physics.hold_tail_relax = 0.0
+        hold = Note(time=0, x=-0.25, y=0.0, type="hold",
+                    params={"end": 1000, "duration": 1000})
+        tap = Note(time=1000, x=0.25, y=0.0, type="tap")
+        scoring = Scoring([hold, tap], config)
+        self.assertEqual(scoring.move_cost(0, 1, "L"), 0.0)
+
+    def test_conflict_inside_window_charged_once(self) -> None:
+        """**权重侧窗口之内**（仍算按住期间）：冲突只由 busy 收一次，不叠加 40.0。"""
+        scoring, _hold, _tap = self._pair(key_x=0.25, key_time=900)
+        same = scoring.evaluate(["L", "L"])
+        other = scoring.evaluate(["L", "R"])
+        self.assertEqual(same.move, 0.0, "手还按着长条，不做位移判定")
+        self.assertAlmostEqual(same.busy, scoring.cost.busy, places=6)
+        self.assertEqual(other.busy, 0.0)
+
+    def test_tail_instant_other_position_outside_weight_window(self) -> None:
+        """**尾时刻（真实结尾）已不在权重侧窗口内**：不另收 busy，位移照常结算。
+
+        ``hold_tail_relax`` 只动权重侧（提前松手）；真实区间内的硬冲突仍由
+        ``hold_conflict`` / ``hold_tail_hand`` 负责（同刻同位置必须同手那两条用例）。
+        """
         scoring, _hold, _tap = self._pair(key_x=0.25)
         same = scoring.evaluate(["L", "L"])
         other = scoring.evaluate(["L", "R"])
-        # 关键：两边都不该出现"位移"（同刻没有移动过程）
-        self.assertEqual(same.move, 0.0)
+        self.assertEqual(same.busy, 0.0, "尾时刻已在权重侧窗口之外")
+        self.assertGreater(same.move, 0.0)
+        self.assertLess(same.move, 40.0, "不该是 40.0 封顶罚")
         self.assertEqual(other.move, 0.0)
-        # 冲突只体现为 busy，且只收一次
-        self.assertAlmostEqual(same.busy, scoring.cost.busy, places=6)
-        self.assertEqual(other.busy, 0.0)
 
     def test_offsets_minus2_to_plus2_agree(self) -> None:
         """长条尾前后 ±2ms 应当得到同样的位移代价（曾经只有 0 例外）。"""
